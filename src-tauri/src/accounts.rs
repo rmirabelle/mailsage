@@ -1,7 +1,7 @@
 /** The commands that the window calls for accounts, folders, and message lists. */
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use anyhow::{bail, Context, Result};
@@ -10,12 +10,30 @@ use tauri::{AppHandle, State};
 use tokio::sync::Notify;
 
 use crate::store::{Account, Folder, MessageHeader, Store};
-use crate::{google, imap, secrets};
+use tauri_plugin_dialog::DialogExt;
+use tauri_plugin_opener::OpenerExt;
+
+use crate::links::{self, LinkCheck};
+use crate::preview::{self, MessageView};
+use crate::{google, imap, remote, secrets};
 
 /** How many of a folder's newest messages the list shows. */
 const MESSAGE_LIST_SIZE: u32 = 200;
 /** An access token with less time left than this is replaced before use. */
 const TOKEN_SAFETY_MARGIN: Duration = Duration::from_secs(60);
+/** The preview does not fetch a message larger than this. */
+const MAX_MESSAGE_BYTES: u32 = 40 * 1024 * 1024;
+/** How many opened messages stay in memory, so that "load images" and "save attachment" need no second fetch. */
+const OPENED_MESSAGES_KEPT: usize = 6;
+/** The mark that Windows puts on a file from the internet: zone 3. Programs then open the file with care. */
+const INTERNET_ZONE_MARK: &str = "[ZoneTransfer]\r\nZoneId=3\r\n";
+
+/** A raw message that the user opened, by folder and message number. */
+struct OpenedMessage {
+    folder_id: i64,
+    uid: u32,
+    raw: Arc<Vec<u8>>,
+}
 
 struct AccessToken {
     value: String,
@@ -28,6 +46,8 @@ pub struct AppState {
     access_tokens: Mutex<HashMap<i64, AccessToken>>,
     sign_in_running: AtomicBool,
     sign_in_cancel: Notify,
+    /** The last few opened messages. They stay in memory only; Mail Sage does not write message bodies to the disk. */
+    opened: Mutex<VecDeque<OpenedMessage>>,
 }
 
 impl AppState {
@@ -37,6 +57,7 @@ impl AppState {
             access_tokens: Mutex::new(HashMap::new()),
             sign_in_running: AtomicBool::new(false),
             sign_in_cancel: Notify::new(),
+            opened: Mutex::new(VecDeque::new()),
         }
     }
 
@@ -61,6 +82,37 @@ impl AppState {
         let (value, expires_in) = google::refresh(&refresh_token).await?;
         self.keep_access_token(account.id, value.clone(), expires_in);
         Ok(value)
+    }
+
+    fn opened(&self) -> std::sync::MutexGuard<'_, VecDeque<OpenedMessage>> {
+        self.opened.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    fn opened_message(&self, folder_id: i64, uid: u32) -> Option<Arc<Vec<u8>>> {
+        self.opened().iter().find(|message| message.folder_id == folder_id && message.uid == uid).map(|message| message.raw.clone())
+    }
+
+    /** The raw bytes of a message: from memory, or fetched from the server. */
+    async fn raw_message(&self, folder_id: i64, uid: u32) -> Result<Arc<Vec<u8>>> {
+        if let Some(raw) = self.opened_message(folder_id, uid) {
+            return Ok(raw);
+        }
+        if self.store.message_size(folder_id, uid)? > MAX_MESSAGE_BYTES {
+            bail!("This message is too large for the preview.");
+        }
+        let folder = self.store.folder(folder_id)?;
+        let uid_validity = self.store.folder_uid_validity(folder_id)?;
+        let account = self.store.account(folder.account_id)?;
+        let mut session = self.open_session(&account).await?;
+        let raw = imap::fetch_message(&mut session, &folder.path, uid_validity, uid).await;
+        let _ = session.logout().await;
+        let raw = Arc::new(raw?);
+        let mut opened = self.opened();
+        opened.push_back(OpenedMessage { folder_id, uid, raw: raw.clone() });
+        while opened.len() > OPENED_MESSAGES_KEPT {
+            opened.pop_front();
+        }
+        Ok(raw)
     }
 
     async fn open_session(&self, account: &Account) -> Result<imap::Session> {
@@ -92,6 +144,11 @@ pub struct AccountView {
 
 fn text(error: anyhow::Error) -> String {
     format!("{error:#}")
+}
+
+/** The same as `text`, for a command that has a parameter named `text`. */
+fn error_text(error: anyhow::Error) -> String {
+    text(error)
 }
 
 fn account_views(store: &Store) -> Result<Vec<AccountView>> {
@@ -161,6 +218,7 @@ pub async fn remove_account(state: State<'_, AppState>, account_id: i64) -> Resu
     }
     secrets::delete(&target).map_err(text)?;
     state.tokens().remove(&account_id);
+    state.opened().clear();
     state.store.delete_account(account_id).map_err(text)
 }
 
@@ -203,4 +261,72 @@ async fn sync_folder_messages(state: &AppState, folder_id: i64) -> Result<Vec<Me
 #[tauri::command]
 pub async fn sync_messages(state: State<'_, AppState>, folder_id: i64) -> Result<Vec<MessageHeader>, String> {
     sync_folder_messages(&state, folder_id).await.map_err(text)
+}
+
+async fn message_view(state: &AppState, folder_id: i64, uid: u32, load_remote: bool) -> Result<MessageView> {
+    let raw = state.raw_message(folder_id, uid).await?;
+    let (mut view, blocked) = preview::build_view(&raw, HashMap::new())?;
+    let trusted = !view.from_address.is_empty() && state.store.is_sender_trusted(&view.from_address)?;
+    view.sender_trusted = trusted;
+    if !(load_remote || trusted) || blocked.is_empty() {
+        return Ok(view);
+    }
+    let images = remote::fetch_images(&blocked).await;
+    let (mut view, _) = preview::build_view(&raw, images)?;
+    view.remote_loaded = true;
+    view.sender_trusted = trusted;
+    Ok(view)
+}
+
+/**
+ * The safe preview of one message. With `load_remote`, or for a sender that
+ * the user trusts, Rust fetches the message's visible remote images and puts
+ * them in the page as data. Tracking pixel images never load.
+ */
+#[tauri::command]
+pub async fn open_message(state: State<'_, AppState>, folder_id: i64, uid: u32, load_remote: bool) -> Result<MessageView, String> {
+    message_view(&state, folder_id, uid, load_remote).await.map_err(text)
+}
+
+async fn save_attachment_file(app: &AppHandle, state: &AppState, folder_id: i64, uid: u32, index: u32) -> Result<Option<String>> {
+    let raw = state.raw_message(folder_id, uid).await?;
+    let (name, bytes) = preview::attachment(&raw, index)?;
+    let dialog = app.dialog().file().set_title("Save attachment").set_file_name(&name);
+    let Some(target) = tauri::async_runtime::spawn_blocking(move || dialog.blocking_save_file()).await? else {
+        return Ok(None);
+    };
+    let path = target.into_path().map_err(|_| anyhow::anyhow!("Mail Sage cannot save to that place"))?;
+    tokio::fs::write(&path, &bytes).await.with_context(|| format!("could not write {}", path.display()))?;
+    /* The mark is a second, hidden stream of the file. A disk that has no such streams (FAT, some network disks) refuses it; the file is saved all the same. */
+    let _ = tokio::fs::write(format!("{}:Zone.Identifier", path.display()), INTERNET_ZONE_MARK).await;
+    Ok(Some(path.display().to_string()))
+}
+
+/**
+ * Saves one attachment where the user chooses, and marks the file as "from
+ * the internet". It never opens the file. Returns the path, or nothing when
+ * the user cancelled.
+ */
+#[tauri::command]
+pub async fn save_attachment(app: AppHandle, state: State<'_, AppState>, folder_id: i64, uid: u32, index: u32) -> Result<Option<String>, String> {
+    save_attachment_file(&app, &state, folder_id, uid, index).await.map_err(text)
+}
+
+/** Adds a sender address to the list of senders whose remote images always load, or removes it. */
+#[tauri::command]
+pub fn set_sender_trusted(state: State<'_, AppState>, address: String, trusted: bool) -> Result<(), String> {
+    state.store.set_sender_trusted(&address, trusted).map_err(text)
+}
+
+/** Checks a link from a message. `text` is what the message shows for the link. Nothing opens. */
+#[tauri::command]
+pub fn check_link(href: String, text: String) -> Result<LinkCheck, String> {
+    links::check(&href, &text).map_err(error_text)
+}
+
+/** Opens a web link in the default browser, after the user confirmed it. The address is checked and cleaned again here. */
+#[tauri::command]
+pub fn open_link(app: AppHandle, url: String) -> Result<(), String> {
+    let link = links::check(&url, "").map_err(error_text)?;
+    app.opener().open_url(link.url, None::<&str>).map_err(|error| format!("could not open the browser: {error}"))
 }

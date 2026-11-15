@@ -1,6 +1,9 @@
 mod accounts;
 mod google;
 mod imap;
+mod links;
+mod preview;
+mod remote;
 mod secrets;
 mod store;
 mod updater;
@@ -35,6 +38,8 @@ pub fn run() {
         )
         /* Rust uses this to open the sign-in page in the browser. The window has no permission to use it. */
         .plugin(tauri_plugin_opener::init())
+        /* Rust uses this for the "Save as" dialog of an attachment. The window has no permission to use it. */
+        .plugin(tauri_plugin_dialog::init())
         .setup(|app| {
             let path = app.path().app_data_dir()?.join(STORE_FILE);
             let store = store::Store::open(&path)?;
@@ -50,6 +55,11 @@ pub fn run() {
             accounts::sync_folders,
             accounts::list_messages,
             accounts::sync_messages,
+            accounts::open_message,
+            accounts::save_attachment,
+            accounts::set_sender_trusted,
+            accounts::check_link,
+            accounts::open_link,
             window::cursor_position,
             window::log_frontend_error,
             updater::check_for_update,

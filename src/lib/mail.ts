@@ -55,3 +55,54 @@ export function formatMessageDate(seconds: number, now = new Date()): string {
   const sameYear = date.getFullYear() === now.getFullYear();
   return date.toLocaleDateString(undefined, sameYear ? { month: "short", day: "numeric" } : { year: "numeric", month: "short", day: "numeric" });
 }
+
+export type AttachmentInfo = {
+  index: number;
+  name: string;
+  mime: string;
+  size: number;
+  /** True for a file type that can run code or hold macros. */
+  risky: boolean;
+};
+
+export type MessageView = {
+  subject: string;
+  from_name: string;
+  from_address: string;
+  to: string;
+  cc: string;
+  /** The full, cleaned page for the preview frame. */
+  html: string;
+  /** Remote images that are not shown. The user can ask for these. */
+  blocked_images: number;
+  /** Tracking pixel images that Mail Sage removed. These never load. */
+  blocked_trackers: number;
+  /** True when images from this sender always load. */
+  sender_trusted: boolean;
+  remote_loaded: boolean;
+  attachments: AttachmentInfo[];
+};
+
+export type LinkCheck = {
+  /** The address that opens, with tracking parameters removed. */
+  url: string;
+  host: string;
+  tracking_removed: boolean;
+  text_mismatch: boolean;
+  lookalike_risk: boolean;
+  had_user_part: boolean;
+  not_encrypted: boolean;
+};
+
+export const openMessage = (folderId: number, uid: number, loadRemote: boolean) => invoke<MessageView>("open_message", { folderId, uid, loadRemote });
+/** Opens a "Save as" dialog. Resolves with the saved path, or null when the user cancelled. */
+export const saveAttachment = (folderId: number, uid: number, index: number) => invoke<string | null>("save_attachment", { folderId, uid, index });
+export const setSenderTrusted = (address: string, trusted: boolean) => invoke<void>("set_sender_trusted", { address, trusted });
+export const checkLink = (href: string, text: string) => invoke<LinkCheck>("check_link", { href, text });
+export const openLink = (url: string) => invoke<void>("open_link", { url });
+
+export function formatFileSize(bytes: number): string {
+  if (bytes < 1024) return `${bytes} B`;
+  if (bytes < 1024 * 1024) return `${Math.round(bytes / 1024)} KB`;
+  return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
+}

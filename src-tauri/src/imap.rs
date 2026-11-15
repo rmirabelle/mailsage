@@ -208,6 +208,29 @@ pub async fn fetch_newest(session: &mut Session, path: &str, count: u32) -> Resu
     Ok(result)
 }
 
+/**
+ * Fetches one full message as raw bytes. The folder opens read-only and the
+ * message stays unread on the server. `uid_validity` is the folder's
+ * numbering mark from the time the list was read: if the server has numbered
+ * the folder again, the number could be a different message, so the fetch
+ * stops.
+ */
+pub async fn fetch_message(session: &mut Session, path: &str, uid_validity: Option<u32>, uid: u32) -> Result<Vec<u8>> {
+    let mailbox = session.examine(path).await.context("the server did not open the folder")?;
+    if mailbox.uid_validity != uid_validity {
+        bail!("The folder changed on the server. Refresh the message list.");
+    }
+    let mut fetches = session.uid_fetch(uid.to_string(), "(UID BODY.PEEK[])").await.context("the server did not send the message")?;
+    let mut raw = None;
+    while let Some(fetch) = fetches.next().await {
+        let fetch = fetch.context("the server sent a message that Mail Sage cannot read")?;
+        if fetch.uid == Some(uid) {
+            raw = fetch.body().map(<[u8]>::to_vec);
+        }
+    }
+    raw.context("The message is no longer on the server. Refresh the message list.")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

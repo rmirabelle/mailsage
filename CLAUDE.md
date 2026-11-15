@@ -27,6 +27,14 @@ order of work.
   `store.rs` is the SQLite store (accounts, folders, message headers).
   `secrets.rs` is Windows Credential Manager. `google.rs` is the Google
   sign-in. `imap.rs` reads folders and headers from the server.
+- `src-tauri/src/preview.rs` is the secure preview: it cleans message HTML and
+  builds the page for the preview frame. Its tests are the set of hostile
+  emails; add a test there for each new attack. `links.rs` checks a link
+  before it opens. `remote.rs` fetches remote images (only when the user
+  asks, never from the local network). `src/components/MessagePreview.tsx`
+  shows the page in a frame that cannot run scripts.
+- Message bodies are not written to the disk. The last few opened messages
+  stay in memory (`AppState::opened` in `accounts.rs`).
 - `src-tauri/build.rs` reads the sign-in client values from the environment
   or from the gitignored `secrets/oauth.env`; the code embeds them with
   `obfstr`. `docs/GOOGLE-SETUP.md` has the registration steps.

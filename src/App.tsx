@@ -5,7 +5,9 @@ import { AboutDialog } from "./components/AboutDialog";
 import { AccountsPane } from "./components/AccountsPane";
 import { AddAccountDialog } from "./components/AddAccountDialog";
 import { ConfirmDialog } from "./components/ConfirmDialog";
+import { MenuBar, type Menu } from "./components/MenuBar";
 import { MessageList } from "./components/MessageList";
+import { MessagePreview } from "./components/MessagePreview";
 import { TitleBar } from "./components/TitleBar";
 import { listAccounts, listMessages, removeAccount, syncFolders, syncMessages, type Account, type Folder, type MessageHeader } from "./lib/mail";
 import { checkForUpdate, getAppVersion, type UpdateInfo } from "./lib/updater";
@@ -33,6 +35,8 @@ export default function App() {
     () => accounts.flatMap((account) => account.folders).find((folder) => folder.id === selectedFolderId) ?? null,
     [accounts, selectedFolderId]
   );
+
+  const selectedMessage = useMemo(() => messages.find((message) => message.uid === selectedUid) ?? null, [messages, selectedUid]);
 
   const setAccountBusy = (accountId: number, busy: boolean) => {
     setBusyAccountIds((current) => {
@@ -124,9 +128,14 @@ export default function App() {
     }
   };
 
+  const menus: Menu[] = [
+    { id: "help", label: "Help", items: [{ label: "About Mail Sage", run: () => setAboutOpen(true) }] }
+  ];
+
   return (
     <div className="app">
       <TitleBar updateAvailable={startupUpdate !== null} onAbout={() => setAboutOpen(true)} />
+      <MenuBar menus={menus} />
       <main className="panes">
         <AccountsPane
           accounts={accounts}
@@ -147,12 +156,16 @@ export default function App() {
           onSelect={(message) => setSelectedUid(message.uid)}
           onRefresh={() => selectedFolder && void openFolder(selectedFolder)}
         />
-        <section className="pane preview-pane" aria-label="Secure preview">
-          <div className="pane-empty">
-            <ShieldCheck size={30} />
-            <p>{selectedUid === null ? "Select a message to read it here." : "The secure preview comes in the next step of the plan."}</p>
-          </div>
-        </section>
+        {selectedFolder && selectedMessage ? (
+          <MessagePreview folderId={selectedFolder.id} message={selectedMessage} />
+        ) : (
+          <section className="pane preview-pane" aria-label="Secure preview">
+            <div className="pane-empty">
+              <ShieldCheck size={30} />
+              <p>Select a message to read it here.</p>
+            </div>
+          </section>
+        )}
       </main>
       {aboutOpen && (
         <AboutDialog version={version} initialUpdateInfo={startupUpdate} onClose={() => setAboutOpen(false)} />

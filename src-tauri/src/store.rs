@@ -10,7 +10,10 @@ use anyhow::{bail, Context, Result};
 use rusqlite::{params, Connection, OptionalExtension};
 use serde::Serialize;
 
-const SCHEMA_VERSION: i64 = 1;
+const SCHEMA_VERSION: i64 = 2;
+
+/** Added in version 2: the senders whose remote images always load. */
+const TRUSTED_SENDERS_SCHEMA: &str = "CREATE TABLE trusted_senders (address TEXT PRIMARY KEY COLLATE NOCASE);";
 
 const SCHEMA: &str = "
 CREATE TABLE accounts (
@@ -124,12 +127,13 @@ impl Store {
     fn prepare(connection: Connection) -> Result<Self> {
         connection.pragma_update(None, "foreign_keys", true)?;
         let version: i64 = connection.query_row("PRAGMA user_version", [], |row| row.get(0))?;
-        if version == 0 {
-            connection.execute_batch(SCHEMA)?;
-            connection.pragma_update(None, "user_version", SCHEMA_VERSION)?;
-        } else if version != SCHEMA_VERSION {
-            bail!("the mail store has version {version}, and this Mail Sage reads version {SCHEMA_VERSION}");
+        match version {
+            0 => connection.execute_batch(&format!("{SCHEMA}{TRUSTED_SENDERS_SCHEMA}"))?,
+            1 => connection.execute_batch(TRUSTED_SENDERS_SCHEMA)?,
+            SCHEMA_VERSION => {}
+            _ => bail!("the mail store has version {version}, and this Mail Sage reads version {SCHEMA_VERSION}"),
         }
+        connection.pragma_update(None, "user_version", SCHEMA_VERSION)?;
         Ok(Self { connection: Mutex::new(connection) })
     }
 
@@ -260,6 +264,37 @@ impl Store {
         Ok(())
     }
 
+    /** True when the user said that remote images from this sender address always load. */
+    pub fn is_sender_trusted(&self, address: &str) -> Result<bool> {
+        Ok(self.lock().query_row("SELECT EXISTS (SELECT 1 FROM trusted_senders WHERE address = ?1)", [address.trim()], |row| row.get(0))?)
+    }
+
+    pub fn set_sender_trusted(&self, address: &str, trusted: bool) -> Result<()> {
+        let address = address.trim();
+        if address.is_empty() {
+            bail!("this message has no sender address");
+        }
+        let statement = if trusted { "INSERT OR IGNORE INTO trusted_senders (address) VALUES (?1)" } else { "DELETE FROM trusted_senders WHERE address = ?1" };
+        self.lock().execute(statement, [address])?;
+        Ok(())
+    }
+
+    /** The server's numbering mark of a folder, as stored with its messages. */
+    pub fn folder_uid_validity(&self, folder_id: i64) -> Result<Option<u32>> {
+        self.lock()
+            .query_row("SELECT uid_validity FROM folders WHERE id = ?1", [folder_id], |row| row.get(0))
+            .optional()?
+            .context("the folder does not exist")
+    }
+
+    /** The stored size in bytes of one message. */
+    pub fn message_size(&self, folder_id: i64, uid: u32) -> Result<u32> {
+        self.lock()
+            .query_row("SELECT size FROM messages WHERE folder_id = ?1 AND uid = ?2", params![folder_id, uid], |row| row.get(0))
+            .optional()?
+            .context("the message is not in the list. Refresh the folder.")
+    }
+
     /** The newest messages of a folder first. */
     pub fn messages(&self, folder_id: i64, limit: u32) -> Result<Vec<MessageHeader>> {
         let connection = self.lock();
@@ -349,6 +384,29 @@ mod tests {
         /* The server numbered the folder again: all the old messages go. */
         store.save_messages(inbox, Some(8), 1, &[header(1, 500)]).unwrap();
         assert_eq!(uids(&store), [1]);
+    }
+
+    #[test]
+    fn remembers_trusted_senders_without_regard_to_letter_case() {
+        let store = Store::open_in_memory().unwrap();
+        assert!(!store.is_sender_trusted("news@shop.example").unwrap());
+        store.set_sender_trusted("News@Shop.example", true).unwrap();
+        store.set_sender_trusted("news@shop.example", true).unwrap();
+        assert!(store.is_sender_trusted("news@shop.example").unwrap());
+        assert!(!store.is_sender_trusted("other@shop.example").unwrap());
+        store.set_sender_trusted("NEWS@shop.example", false).unwrap();
+        assert!(!store.is_sender_trusted("news@shop.example").unwrap());
+        assert!(store.set_sender_trusted("  ", true).is_err());
+    }
+
+    #[test]
+    fn upgrades_a_version_1_store() {
+        let connection = Connection::open_in_memory().unwrap();
+        connection.execute_batch(SCHEMA).unwrap();
+        connection.pragma_update(None, "user_version", 1).unwrap();
+        let store = Store::prepare(connection).unwrap();
+        store.set_sender_trusted("a@example.com", true).unwrap();
+        assert!(store.is_sender_trusted("a@example.com").unwrap());
     }
 
     #[test]

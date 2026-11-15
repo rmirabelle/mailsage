@@ -1,6 +1,6 @@
 import { isTauri } from "@tauri-apps/api/core";
 import { getCurrentWindow } from "@tauri-apps/api/window";
-import { DownloadSimple, Info } from "@phosphor-icons/react";
+import { DownloadSimple } from "@phosphor-icons/react";
 import { WindowControls } from "./WindowControls";
 
 interface Props {
@@ -8,7 +8,7 @@ interface Props {
   onAbout: () => void;
 }
 
-/** The window's title bar: the app name, the update button when an update is ready, the About button, and the window controls. */
+/** The window's title bar: the app name, the update button when an update is ready, and the window controls. */
 export function TitleBar({ updateAvailable, onAbout }: Props) {
   return (
     <header
@@ -28,15 +28,6 @@ export function TitleBar({ updateAvailable, onAbout }: Props) {
         </button>
       )}
       <div className="titlebar-spacer" data-tauri-drag-region />
-      <button
-        className="titlebar-icon-button"
-        onClick={onAbout}
-        onDoubleClick={(event) => event.stopPropagation()}
-        aria-label="About Mail Sage"
-        title="About Mail Sage"
-      >
-        <Info size={16} />
-      </button>
       <WindowControls />
     </header>
   );
