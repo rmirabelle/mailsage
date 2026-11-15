@@ -1,0 +1,44 @@
+[package]
+name = "mailsage"
+version = "0.1.0"
+description = "A private, secure email client"
+authors = ["Rob Mirabelle"]
+edition = "2021"
+
+[lib]
+name = "mailsage_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+tauri = { version = "2", features = [] }
+tauri-plugin-window-state = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+anyhow = "1"
+futures-util = "0.3"
+tokio = { version = "1", features = ["fs", "io-util", "macros", "net", "rt", "sync", "time"] }
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json", "stream"] }
+rusqlite = { version = "0.42.0", features = ["bundled"] }
+async-imap = { version = "0.12.0", default-features = false, features = ["runtime-tokio"] }
+tokio-rustls = { version = "0.26.6", default-features = false, features = ["ring", "tls12"] }
+webpki-roots = "1.0.12"
+mail-parser = "0.11.9"
+sha2 = "0.11.1"
+base64 = "0.23.1"
+rand = "0.10.3"
+url = "2.5.8"
+utf7-imap = "0.3.2"
+tauri-plugin-opener = "2.7.3"
+obfstr = "0.4.6"
+
+[target.'cfg(windows)'.dependencies]
+tauri-plugin-single-instance = "2"
+windows = { version = "0.61.3", features = [
+  "Win32_Foundation",
+  "Win32_Security_Credentials",
+  "Win32_UI_HiDpi",
+  "Win32_UI_WindowsAndMessaging"
+] }
