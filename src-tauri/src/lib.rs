@@ -1,4 +1,5 @@
 mod accounts;
+mod compose;
 mod google;
 mod imap;
 mod links;
@@ -9,9 +10,32 @@ mod store;
 mod updater;
 mod window;
 
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::Duration;
+
 use tauri::Manager;
+use tauri_plugin_window_state::{AppHandleExt, StateFlags};
 
 const STORE_FILE: &str = "mailsage.db";
+
+/** Counts the moves and size changes of the window. A delayed save runs only if no newer change came after it. */
+static WINDOW_CHANGES: AtomicU64 = AtomicU64::new(0);
+const WINDOW_SAVE_DELAY: Duration = Duration::from_millis(600);
+
+/**
+ * Saves the window size and position a short time after the last change.
+ * The plugin saves them only at a normal exit; this keeps them also when
+ * the app stops in a different way (a kill, a crash, an installer).
+ */
+fn save_window_state_soon(app: tauri::AppHandle, flags: StateFlags) {
+    let change = WINDOW_CHANGES.fetch_add(1, Ordering::SeqCst) + 1;
+    tauri::async_runtime::spawn(async move {
+        tokio::time::sleep(WINDOW_SAVE_DELAY).await;
+        if WINDOW_CHANGES.load(Ordering::SeqCst) == change {
+            let _ = app.save_window_state(flags);
+        }
+    });
+}
 
 fn restore_main_window(app: &tauri::AppHandle) {
     if let Some(main) = app.get_webview_window("main") {
@@ -23,9 +47,7 @@ fn restore_main_window(app: &tauri::AppHandle) {
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
-    let window_state_flags = tauri_plugin_window_state::StateFlags::SIZE
-        | tauri_plugin_window_state::StateFlags::POSITION
-        | tauri_plugin_window_state::StateFlags::MAXIMIZED;
+    let window_state_flags = StateFlags::SIZE | StateFlags::POSITION | StateFlags::MAXIMIZED;
 
     tauri::Builder::default()
         .plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| {
@@ -40,6 +62,11 @@ pub fn run() {
         .plugin(tauri_plugin_opener::init())
         /* Rust uses this for the "Save as" dialog of an attachment. The window has no permission to use it. */
         .plugin(tauri_plugin_dialog::init())
+        .on_window_event(move |window, event| {
+            if matches!(event, tauri::WindowEvent::Moved(_) | tauri::WindowEvent::Resized(_)) {
+                save_window_state_soon(window.app_handle().clone(), window_state_flags);
+            }
+        })
         .setup(|app| {
             let path = app.path().app_data_dir()?.join(STORE_FILE);
             let store = store::Store::open(&path)?;
@@ -55,9 +82,19 @@ pub fn run() {
             accounts::sync_folders,
             accounts::list_messages,
             accounts::sync_messages,
+            accounts::load_older_messages,
+            accounts::search_messages,
             accounts::open_message,
+            accounts::prefetch_messages,
             accounts::save_attachment,
             accounts::set_sender_trusted,
+            accounts::set_messages_seen,
+            accounts::delete_messages,
+            accounts::mark_folder_seen,
+            accounts::delete_folder_messages,
+            accounts::reply_draft,
+            accounts::pick_attachments,
+            accounts::send_message,
             accounts::check_link,
             accounts::open_link,
             window::cursor_position,

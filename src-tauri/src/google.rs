@@ -22,6 +22,7 @@ use tokio::sync::Notify;
 
 pub const IMAP_HOST: &str = "imap.gmail.com";
 pub const IMAP_PORT: u16 = 993;
+pub const SMTP_HOST: &str = "smtp.gmail.com";
 
 const AUTH_URL: &str = "https://accounts.google.com/o/oauth2/v2/auth";
 const TOKEN_URL: &str = "https://oauth2.googleapis.com/token";

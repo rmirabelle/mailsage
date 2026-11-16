@@ -6,8 +6,10 @@
   color-scheme: dark;
   font-synthesis: none;
   text-rendering: optimizeLegibility;
-  --accent: #4b76f7;
-  --accent-hover: #7393f9;
+  --accent: #fdfeb4;
+  --accent-hover: #feffd8;
+  /* The colour of text and icons that lie on the accent colour. */
+  --on-accent: #1d2029;
   --secondary: #a9ddf8;
   --secondary-hover: #c9ecff;
   --border: #393d4d;
@@ -37,7 +39,7 @@ button { border: 0; }
 }
 .brand { display: flex; align-items: center; gap: 6px; padding: 0 13px; pointer-events: none; }
 .brand img { width: 18px; height: 18px; }
-.brand span { color: var(--secondary); font-size: 12px; font-weight: 800; letter-spacing: .04em; }
+.brand span { color: var(--accent); font-size: 12px; font-weight: 800; letter-spacing: .04em; }
 .brand .brand-dev { padding: 1px 5px; border-radius: 3px; color: #1d2029; background: #f5a524; font-size: 10px; letter-spacing: .08em; }
 .titlebar-update-button {
   align-self: center;
@@ -48,7 +50,7 @@ button { border: 0; }
   margin-left: 7px;
   padding: 0 9px;
   border-radius: 5px;
-  color: #ffffff;
+  color: var(--on-accent);
   background: var(--accent);
   font-size: 10px;
   font-weight: 750;
@@ -126,8 +128,32 @@ button { border: 0; }
   flex: 1;
   min-height: 0;
   display: grid;
-  grid-template-columns: 240px minmax(280px, 380px) minmax(0, 1fr);
+  grid-template-columns: 240px 360px minmax(0, 1fr);
+  position: relative;
 }
+/* The drag line between two panes. It lies on top of the border and takes no column of the grid. */
+.pane-divider {
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  z-index: 5;
+  width: 9px;
+  margin-left: -5px;
+  cursor: col-resize;
+  touch-action: none;
+  outline: none;
+}
+.pane-divider::after {
+  content: "";
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  left: 3px;
+  width: 2px;
+  background: transparent;
+  transition: background .12s;
+}
+.pane-divider:hover::after, .pane-divider:active::after, .pane-divider:focus-visible::after { background: var(--accent); }
 .pane { min-width: 0; min-height: 0; display: flex; flex-direction: column; overflow: hidden; }
 .accounts-pane { border-right: 1px solid var(--border); background: #20232d; }
 .list-pane { border-right: 1px solid var(--border); background: #242832; }
@@ -164,7 +190,7 @@ button { border: 0; }
   border-radius: 6px;
   cursor: pointer;
 }
-.button.primary { color: #ffffff; background: var(--accent); font-weight: 800; }
+.button.primary { color: var(--on-accent); background: var(--accent); font-weight: 800; }
 .button.primary:hover { background: var(--accent-hover); }
 .button.secondary { color: #d4d4d8; background: #343844; border: 1px solid #474c5e; }
 .button.secondary:hover { background: #3d4251; }
@@ -183,7 +209,7 @@ button { border: 0; }
   width: min(460px, 100%);
   position: relative;
   overflow: hidden;
-  border: 1px solid rgba(75,118,247,.3);
+  border: 1px solid rgba(253,254,180,.18);
   border-radius: 14px;
   color: #d9dce3;
   background: #242832;
@@ -211,7 +237,7 @@ button { border: 0; }
   align-items: center;
   gap: 22px;
   padding: 17px 26px 14.5px;
-  background: radial-gradient(circle at 22% 46%, rgba(75,118,247,.075), transparent 38%), linear-gradient(180deg, #292d37, #242832);
+  background: radial-gradient(circle at 22% 46%, rgba(253,254,180,.05), transparent 38%), linear-gradient(180deg, #292d37, #242832);
 }
 .about-app-icon { width: 128px; height: 128px; display: grid; place-items: center; }
 .about-app-icon img { width: 128px; height: 128px; object-fit: contain; }
@@ -318,20 +344,42 @@ button { border: 0; }
 }
 .folder-row svg { flex: 0 0 auto; color: var(--muted); }
 .folder-row:hover:not(:disabled) { background: rgba(255,255,255,.05); }
-.folder-row.selected { color: #ffffff; background: rgba(75,118,247,.28); }
-.folder-row.selected svg { color: var(--secondary); }
+.folder-row.selected { color: var(--accent); background: rgba(253,254,180,.16); }
+.folder-row.selected svg { color: var(--accent); }
 .folder-row:disabled { color: #6f7586; cursor: default; }
 .folder-name { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .folder-unread { flex: 0 0 auto; color: var(--secondary); font-size: 11px; font-weight: 700; }
 
 /* Message list. */
 .message-list { flex: 1; min-height: 0; overflow-y: auto; }
+/* The heading of a day group ("Today", "Yesterday"). It stays at the top while its messages scroll. */
+.day-heading {
+  position: sticky;
+  top: 0;
+  z-index: 2;
+  width: 100%;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 6px 12px 6px 9px;
+  border-bottom: 1px solid rgba(57,61,77,.6);
+  color: var(--secondary);
+  background: #20232d;
+  font-size: 11px;
+  font-weight: 700;
+  text-align: left;
+  cursor: pointer;
+}
+.day-heading:hover { background: #262a35; }
+.day-heading svg { flex: 0 0 auto; color: var(--muted); }
+.day-name { flex: 1; min-width: 0; }
+.day-count { color: var(--muted); font-weight: 600; }
 .message-row {
   width: 100%;
   display: grid;
   grid-template-columns: minmax(0, 1fr) auto;
   gap: 2px 10px;
-  padding: 8px 12px 9px 14px;
+  padding: 8px 12px 9px 26px;
   border-bottom: 1px solid rgba(57,61,77,.6);
   border-left: 3px solid transparent;
   color: #aeb3c0;
@@ -339,14 +387,38 @@ button { border: 0; }
   text-align: left;
   cursor: pointer;
 }
+/* The chevron lies on top of the row's left padding, so the row keeps its full width. */
+.message-entry { position: relative; }
+.message-expand {
+  position: absolute;
+  left: 6px;
+  top: 7px;
+  z-index: 1;
+  width: 18px;
+  height: 18px;
+  display: grid;
+  place-items: center;
+  border-radius: 4px;
+  color: var(--muted);
+  background: transparent;
+  cursor: pointer;
+}
+/* The older messages under this one have an unread message. */
+.message-expand.has-unread { color: var(--accent); }
+.message-expand:hover { color: var(--accent); background: rgba(255,255,255,.08); }
+/* The other messages from the same sender, under the message. */
+.sender-block { background: rgba(0,0,0,.16); box-shadow: inset 3px 0 0 rgba(253,254,180,.25); }
+.message-row.nested { padding-left: 46px; }
 .message-row:hover { background: rgba(255,255,255,.04); }
-.message-row.selected { background: rgba(75,118,247,.22); }
+.message-row.selected { background: rgba(253,254,180,.12); }
 .message-row.unread { border-left-color: var(--accent); }
-.message-sender { overflow: hidden; font-size: 12.5px; text-overflow: ellipsis; white-space: nowrap; }
+.message-sender { overflow: hidden; color: rgba(253,254,180,.65); font-size: 12.5px; text-overflow: ellipsis; white-space: nowrap; }
 .message-date { color: var(--muted); font-size: 11px; white-space: nowrap; }
 .message-subject { overflow: hidden; color: #8f95a4; font-size: 12px; text-overflow: ellipsis; white-space: nowrap; }
-.message-row.unread .message-sender { color: #ffffff; font-weight: 700; }
-.message-row.unread .message-subject { color: #d4d7de; }
+.message-row.unread .message-sender { color: var(--accent); font-weight: 700; }
+.preview-line dd.preview-sender { color: var(--accent); }
+.preview-line dd.preview-recipient { color: var(--secondary); }
+.message-row.unread .message-subject { color: #ffffff; }
 .message-flag { justify-self: end; color: #f5c542; }
 .list-error { display: flex; align-items: flex-start; gap: 7px; margin: 0; padding: 8px 14px; color: #fecaca; background: rgba(196,43,28,.16); font-size: 11.5px; line-height: 1.4; }
 .list-error svg { flex: 0 0 auto; margin-top: 1px; color: #f87171; }
@@ -386,7 +458,7 @@ button { border: 0; }
 .preview-line { display: flex; gap: 8px; margin-top: 2px; color: #aeb3c0; font-size: 12px; line-height: 1.45; }
 .preview-line dt { flex: 0 0 34px; color: var(--muted); }
 .preview-line dd { min-width: 0; margin: 0; overflow-wrap: anywhere; }
-.preview-line strong { color: #e4e6eb; font-weight: 650; }
+.preview-line strong { color: inherit; font-weight: 650; }
 .preview-fields { margin: 0; }
 .preview-date { margin-top: 6px; color: var(--muted); font-size: 11px; }
 .preview-bar {
@@ -448,3 +520,153 @@ button { border: 0; }
 .link-warnings li.info { color: #c9ecd0; }
 .link-warnings li.info svg { color: #63d28a; }
 .about-dialog.link-dialog { width: min(520px, 100%); }
+
+/* Right-click menu, the same look as the other Sage apps. */
+.toolbar-dropdown {
+  position: absolute;
+  z-index: 50;
+  min-width: 210px;
+  padding: 5px;
+  border: 1px solid #3a3f4d;
+  border-radius: 8px;
+  background: #242832;
+  box-shadow: 0 14px 40px rgba(0,0,0,.55);
+}
+.toolbar-dropdown-item {
+  width: 100%;
+  display: block;
+  padding: 6px 9px;
+  border-radius: 5px;
+  color: #d8dbe2;
+  background: transparent;
+  font-size: 12px;
+  text-align: left;
+  cursor: pointer;
+}
+.toolbar-dropdown-item:hover { color: #fff; background: rgba(253,254,180,.18); }
+.toolbar-dropdown.context-menu { position: fixed; z-index: 150; min-width: 200px; }
+.context-menu .toolbar-dropdown-item { display: flex; align-items: center; gap: 9px; }
+.context-menu-icon { display: grid; flex: 0 0 auto; place-items: center; width: 16px; color: var(--muted); }
+.context-menu .toolbar-dropdown-item:hover .context-menu-icon { color: var(--secondary); }
+.context-menu .toolbar-dropdown-item:disabled { opacity: .4; cursor: default; }
+.context-menu .toolbar-dropdown-item:disabled:hover { background: transparent; }
+
+/* Preview actions: reply, forward, delete. */
+.preview-header { position: relative; }
+.preview-actions { display: flex; gap: 2px; float: right; margin: -4px -6px 4px 10px; }
+.preview-actions .icon-button { width: 28px; height: 28px; }
+.preview-actions .icon-button:disabled { opacity: .4; cursor: default; }
+.message-row.context { background: rgba(255,255,255,.07); }
+
+/* Compose dialog. */
+.about-dialog.compose-dialog { width: min(760px, 100%); height: min(680px, 100%); display: flex; flex-direction: column; }
+.compose-body { flex: 1; min-height: 0; display: flex; flex-direction: column; padding: 16px 20px 12px; }
+.compose-body h2 { margin: 0 0 10px; padding-right: 30px; color: var(--secondary); font-size: 17px; font-weight: 750; }
+.compose-row { display: flex; align-items: center; gap: 10px; border-bottom: 1px solid #3a3e4d; }
+.compose-row label { flex: 0 0 56px; color: var(--muted); font-size: 12px; }
+.compose-row input, .compose-row select {
+  flex: 1;
+  min-width: 0;
+  height: 32px;
+  padding: 0 2px;
+  border: 0;
+  color: #e4e6eb;
+  background: transparent;
+  font-size: 13px;
+  user-select: text;
+}
+.compose-row select option { color: #e4e6eb; background: #242832; }
+.compose-row .compose-toggle { flex: 0 0 auto; padding: 2px 6px; color: var(--secondary); background: transparent; font-size: 11.5px; cursor: pointer; }
+.compose-text {
+  flex: 1;
+  min-height: 120px;
+  margin-top: 10px;
+  padding: 10px 12px;
+  border: 1px solid #3a3e4d;
+  border-radius: 7px;
+  color: #e4e6eb;
+  background: #1d2029;
+  font-size: 13px;
+  line-height: 1.5;
+  resize: none;
+  user-select: text;
+}
+.compose-text:focus, .compose-row:focus-within { border-color: var(--accent); }
+.compose-files { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 8px; }
+.compose-file { display: flex; align-items: center; gap: 6px; padding: 3px 4px 3px 9px; border: 1px solid #474c5e; border-radius: 6px; color: #d4d7de; background: #30343f; font-size: 11.5px; }
+.compose-file small { color: var(--muted); }
+.compose-file .icon-button { width: 20px; height: 20px; }
+.compose-error { display: flex; align-items: flex-start; gap: 7px; margin: 8px 0 0; color: #fecaca; font-size: 12px; line-height: 1.4; }
+.compose-error svg { flex: 0 0 auto; margin-top: 1px; color: #f87171; }
+.compose-actions { justify-content: space-between; }
+.compose-actions > div { display: flex; gap: 8px; }
+.button:disabled { opacity: .5; cursor: default; }
+.pane-heading-buttons { display: flex; flex: 0 0 auto; gap: 2px; }
+
+/* Settings: the categories on the left, the selected category on the right. */
+.about-dialog.settings-dialog { width: min(880px, 100%); height: min(620px, 100%); display: flex; flex-direction: column; }
+.settings-main { flex: 1; min-height: 0; display: grid; grid-template-columns: 200px minmax(0, 1fr); }
+.settings-categories { display: flex; flex-direction: column; gap: 2px; padding: 18px 8px; border-right: 1px solid #3a3e4d; background: #20232d; }
+.settings-categories h2 { margin: 0 0 12px; padding: 0 10px; color: var(--secondary); font-size: 17px; font-weight: 750; }
+.settings-category {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 7px 10px;
+  border-radius: 5px;
+  color: #c2c6d1;
+  background: transparent;
+  font-size: 12.5px;
+  text-align: left;
+  cursor: pointer;
+}
+.settings-category:hover { background: rgba(255,255,255,.05); }
+.settings-category.selected { color: var(--accent); background: rgba(253,254,180,.16); }
+.settings-page { min-height: 0; overflow-y: auto; padding: 20px 26px; }
+.settings-page h3 { margin: 0 0 16px; color: #f1f2f5; font-size: 15px; font-weight: 700; }
+.settings-check { display: flex; align-items: flex-start; gap: 10px; padding: 6px 0; color: #d9dce3; font-size: 12.5px; cursor: pointer; }
+.settings-check input { width: 15px; height: 15px; margin: 1px 0 0; accent-color: var(--accent); cursor: pointer; }
+.settings-check small { display: block; margin-top: 3px; color: var(--muted); font-size: 11.5px; }
+.dialog-check { margin: 12px 0 4px; }
+
+/* The toolbar above the message list, with the search box. */
+.list-toolbar { padding: 0 10px 8px; border-bottom: 1px solid rgba(57,61,77,.6); }
+.search-box {
+  height: 28px;
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  padding: 0 6px 0 9px;
+  border: 1px solid #3a3e4d;
+  border-radius: 6px;
+  color: var(--muted);
+  background: #1d2029;
+}
+.search-box:focus-within { border-color: var(--accent); }
+.search-box input { flex: 1; min-width: 0; border: 0; outline: none; color: #e4e6eb; background: transparent; font-size: 12.5px; }
+.search-box input::placeholder { color: #6f7586; }
+.search-clear { width: 18px; height: 18px; flex: 0 0 auto; display: grid; place-items: center; border-radius: 4px; color: var(--muted); background: transparent; cursor: pointer; }
+.search-clear:hover { color: #f4f4f5; background: rgba(255,255,255,.08); }
+/* A search is active: the box is yellow, so that the user sees why the list is short. */
+.search-box.active { border-color: var(--accent); color: #1d2029; background: var(--accent); }
+.search-box.active input { color: #000000; font-weight: 700; }
+.search-box.active .search-clear { color: #1d2029; }
+.search-box.active .search-clear:hover { color: #000000; background: rgba(0,0,0,.12); }
+
+/* The end of the message list: the button for older emails, and the note for a search on the server. */
+.list-more {
+  width: 100%;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 7px;
+  padding: 10px 12px;
+  color: var(--secondary);
+  background: transparent;
+  font-size: 12px;
+  font-weight: 700;
+  cursor: pointer;
+}
+.list-more:hover:not(:disabled) { color: var(--secondary-hover); background: rgba(255,255,255,.04); }
+.list-more:disabled { color: var(--muted); cursor: default; }
+.list-status { display: flex; align-items: center; justify-content: center; gap: 7px; margin: 0; padding: 10px 12px; color: var(--muted); font-size: 12px; }

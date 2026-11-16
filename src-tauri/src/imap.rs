@@ -22,6 +22,11 @@ pub type Session = async_imap::Session<TlsStream<TcpStream>>;
 
 const CONNECT_TIME_LIMIT: Duration = Duration::from_secs(20);
 const MAX_REFUSAL_LENGTH: usize = 300;
+/** How many messages one change command to the server names. */
+const CHANGE_BATCH: usize = 500;
+/** A search uses this many words at most, and this many characters of each word. */
+const MAX_SEARCH_WORDS: usize = 8;
+const MAX_SEARCH_WORD_LENGTH: usize = 64;
 /** What one message fetch asks for. BODY.PEEK leaves the message unread on the server. */
 const HEADER_ITEMS: &str = "(UID FLAGS RFC822.SIZE INTERNALDATE BODY.PEEK[HEADER])";
 
@@ -178,34 +183,108 @@ pub async fn fetch_newest(session: &mut Session, path: &str, count: u32) -> Resu
             .context("the server did not send the messages")?;
         while let Some(fetch) = fetches.next().await {
             let fetch = fetch.context("the server sent a message that Mail Sage cannot read")?;
-            let Some(uid) = fetch.uid else { continue };
-            let (subject, from_name, from_address) = fetch.header().map(parse_header).unwrap_or_default();
-            let mut seen = false;
-            let mut flagged = false;
-            for flag in fetch.flags() {
-                match flag {
-                    Flag::Seen => seen = true,
-                    Flag::Flagged => flagged = true,
-                    _ => {}
-                }
-            }
-            result.headers.push(MessageHeader {
-                uid,
-                subject,
-                from_name,
-                from_address,
-                date: fetch.internal_date().map(|date| date.timestamp()).unwrap_or(0),
-                seen,
-                flagged,
-                size: fetch.size.unwrap_or(0),
-            });
+            result.headers.extend(header_of(&fetch));
         }
     }
     if result.headers.is_empty() {
         bail!("the server sent no messages for a folder that has {}", mailbox.exists);
     }
-    result.lowest_uid = result.headers.iter().map(|header| header.uid).min().unwrap_or(1);
+    /* When the fetch started at the first message, it has the full folder: each stored message that is not in it is gone. */
+    result.lowest_uid = if first == 1 { 1 } else { result.headers.iter().map(|header| header.uid).min().unwrap_or(1) };
     Ok(result)
+}
+
+/** Makes a list entry from one fetch answer of the server. An answer with no message number gives nothing. */
+fn header_of(fetch: &async_imap::types::Fetch) -> Option<MessageHeader> {
+    let uid = fetch.uid?;
+    let (subject, from_name, from_address) = fetch.header().map(parse_header).unwrap_or_default();
+    let mut seen = false;
+    let mut flagged = false;
+    for flag in fetch.flags() {
+        match flag {
+            Flag::Seen => seen = true,
+            Flag::Flagged => flagged = true,
+            _ => {}
+        }
+    }
+    Some(MessageHeader {
+        uid,
+        subject,
+        from_name,
+        from_address,
+        date: fetch.internal_date().map(|date| date.timestamp()).unwrap_or(0),
+        seen,
+        flagged,
+        size: fetch.size.unwrap_or(0),
+    })
+}
+
+/** Opens a folder read-only, and stops if the server has numbered the folder again since the list was read. */
+async fn examine_checked(session: &mut Session, path: &str, uid_validity: Option<u32>) -> Result<()> {
+    let mailbox = session.examine(path).await.context("the server did not open the folder")?;
+    if mailbox.uid_validity != uid_validity {
+        bail!("The folder changed on the server. Refresh the message list.");
+    }
+    Ok(())
+}
+
+/** Fetches the headers of the given messages of the open folder. The messages stay unread. */
+async fn fetch_headers(session: &mut Session, uids: &[u32]) -> Result<Vec<MessageHeader>> {
+    let mut headers = Vec::new();
+    if uids.is_empty() {
+        return Ok(headers);
+    }
+    let mut fetches = session.uid_fetch(uid_set(uids), HEADER_ITEMS).await.context("the server did not send the messages")?;
+    while let Some(fetch) = fetches.next().await {
+        let fetch = fetch.context("the server sent a message that Mail Sage cannot read")?;
+        headers.extend(header_of(&fetch).filter(|header| uids.contains(&header.uid)));
+    }
+    Ok(headers)
+}
+
+/** Fetches the headers of the newest `count` messages that are older than the message `before_uid`. The folder opens read-only. */
+pub async fn fetch_older(session: &mut Session, path: &str, uid_validity: Option<u32>, before_uid: u32, count: usize) -> Result<Vec<MessageHeader>> {
+    examine_checked(session, path, uid_validity).await?;
+    if before_uid <= 1 {
+        return Ok(Vec::new());
+    }
+    let uids = search_uids(session, &format!("UID 1:{}", before_uid - 1)).await?;
+    fetch_headers(session, &uids[uids.len().saturating_sub(count)..]).await
+}
+
+/**
+ * Makes the search command for the server from the text that the user
+ * typed: a message matches when its sender or its subject contains each
+ * word. The text is from the user, so each word goes into a quoted string,
+ * and control characters (a line end could start a second command) are
+ * removed. Gives nothing for a text with no usable word.
+ */
+pub fn search_query(text: &str) -> Option<String> {
+    let words: Vec<String> = text
+        .split_whitespace()
+        .map(|word| word.chars().filter(|character| !character.is_control()).take(MAX_SEARCH_WORD_LENGTH).collect::<String>())
+        .filter(|word| !word.is_empty())
+        .take(MAX_SEARCH_WORDS)
+        .collect();
+    if words.is_empty() {
+        return None;
+    }
+    let terms: Vec<String> = words
+        .iter()
+        .map(|word| {
+            let quoted = format!("\"{}\"", word.replace('\\', "\\\\").replace('"', "\\\""));
+            format!("OR FROM {quoted} SUBJECT {quoted}")
+        })
+        .collect();
+    let charset = if text.is_ascii() { "" } else { "CHARSET UTF-8 " };
+    Some(format!("{charset}{}", terms.join(" ")))
+}
+
+/** Searches a full folder on the server, and fetches the headers of the newest `count` messages that match. The folder opens read-only. */
+pub async fn search_headers(session: &mut Session, path: &str, uid_validity: Option<u32>, query: &str, count: usize) -> Result<Vec<MessageHeader>> {
+    examine_checked(session, path, uid_validity).await?;
+    let uids = search_uids(session, query).await?;
+    fetch_headers(session, &uids[uids.len().saturating_sub(count)..]).await
 }
 
 /**
@@ -231,9 +310,151 @@ pub async fn fetch_message(session: &mut Session, path: &str, uid_validity: Opti
     raw.context("The message is no longer on the server. Refresh the message list.")
 }
 
+/**
+ * Fetches several full messages in one request, for loading ahead. The
+ * folder opens read-only and the messages stay unread. A message that is no
+ * longer on the server is left out.
+ */
+pub async fn fetch_messages(session: &mut Session, path: &str, uid_validity: Option<u32>, uids: &[u32]) -> Result<Vec<(u32, Vec<u8>)>> {
+    let mailbox = session.examine(path).await.context("the server did not open the folder")?;
+    if mailbox.uid_validity != uid_validity {
+        bail!("The folder changed on the server. Refresh the message list.");
+    }
+    let mut fetches = session.uid_fetch(uid_set(uids), "(UID BODY.PEEK[])").await.context("the server did not send the messages")?;
+    let mut messages = Vec::new();
+    while let Some(fetch) = fetches.next().await {
+        let fetch = fetch.context("the server sent a message that Mail Sage cannot read")?;
+        if let (Some(uid), Some(body)) = (fetch.uid, fetch.body()) {
+            if uids.contains(&uid) {
+                messages.push((uid, body.to_vec()));
+            }
+        }
+    }
+    Ok(messages)
+}
+
+/** Opens a folder for changes, and stops if the server has numbered the folder again since the list was read. */
+async fn select_checked(session: &mut Session, path: &str, uid_validity: Option<u32>) -> Result<()> {
+    let mailbox = session.select(path).await.context("the server did not open the folder")?;
+    if mailbox.uid_validity != uid_validity {
+        bail!("The folder changed on the server. Refresh the message list.");
+    }
+    Ok(())
+}
+
+fn uid_set(uids: &[u32]) -> String {
+    uids.iter().map(u32::to_string).collect::<Vec<_>>().join(",")
+}
+
+async fn store_flags(session: &mut Session, uids: &[u32], change: &str) -> Result<()> {
+    let mut updates = session.uid_store(uid_set(uids), change).await.context("the server did not change the messages")?;
+    while let Some(update) = updates.next().await {
+        update.context("the server did not change the messages")?;
+    }
+    Ok(())
+}
+
+/** Marks messages as read or as unread on the server. */
+pub async fn set_seen(session: &mut Session, path: &str, uid_validity: Option<u32>, uids: &[u32], seen: bool) -> Result<()> {
+    select_checked(session, path, uid_validity).await?;
+    store_flags(session, uids, if seen { "+FLAGS.SILENT (\\Seen)" } else { "-FLAGS.SILENT (\\Seen)" }).await
+}
+
+/** Removes exactly the given messages from the open folder. This needs a server that can remove messages by number (UIDPLUS). */
+async fn remove_by_uid(session: &mut Session, uids: &[u32]) -> Result<()> {
+    if !session.capabilities().await.context("the server did not list its abilities")?.has_str("UIDPLUS") {
+        bail!("This mail server cannot remove single messages.");
+    }
+    store_flags(session, uids, "+FLAGS.SILENT (\\Deleted)").await?;
+    let removed = session.uid_expunge(uid_set(uids)).await.context("the server did not remove the messages")?;
+    let mut removed = std::pin::pin!(removed);
+    while let Some(result) = removed.next().await {
+        result.context("the server did not remove the messages")?;
+    }
+    Ok(())
+}
+
+/** Moves messages to a different folder on the server (for example, to the trash). */
+pub async fn move_messages(session: &mut Session, path: &str, uid_validity: Option<u32>, uids: &[u32], target: &str) -> Result<()> {
+    select_checked(session, path, uid_validity).await?;
+    move_selected(session, uids, target).await
+}
+
+/** Moves messages out of the open folder. */
+async fn move_selected(session: &mut Session, uids: &[u32], target: &str) -> Result<()> {
+    if session.capabilities().await.context("the server did not list its abilities")?.has_str("MOVE") {
+        return session.uid_mv(uid_set(uids), target).await.context("the server did not move the messages");
+    }
+    session.uid_copy(uid_set(uids), target).await.context("the server did not copy the messages")?;
+    remove_by_uid(session, uids).await
+}
+
+/** Deletes messages from the server for good. They cannot come back. */
+pub async fn delete_forever(session: &mut Session, path: &str, uid_validity: Option<u32>, uids: &[u32]) -> Result<()> {
+    select_checked(session, path, uid_validity).await?;
+    remove_by_uid(session, uids).await
+}
+
+/** The numbers of the messages in the open folder that match a search (for example "ALL" or "UNSEEN"), lowest first. */
+async fn search_uids(session: &mut Session, query: &str) -> Result<Vec<u32>> {
+    let mut uids: Vec<u32> = session.uid_search(query).await.context("the server did not search the folder")?.into_iter().collect();
+    uids.sort_unstable();
+    Ok(uids)
+}
+
+/**
+ * Marks all messages of a folder as read on the server. The change goes to
+ * exactly the messages that are unread now, in batches, so that one command
+ * to the server does not become too long.
+ */
+pub async fn set_all_seen(session: &mut Session, path: &str, uid_validity: Option<u32>) -> Result<()> {
+    select_checked(session, path, uid_validity).await?;
+    let uids = search_uids(session, "UNSEEN").await?;
+    for batch in uids.chunks(CHANGE_BATCH) {
+        store_flags(session, batch, "+FLAGS.SILENT (\\Seen)").await?;
+    }
+    Ok(())
+}
+
+/**
+ * Removes all messages of a folder: with a `target`, they move to that
+ * folder (the trash); with no target, they are deleted for good. Only the
+ * messages that are in the folder at the start are removed; a message that
+ * arrives during the work stays.
+ */
+pub async fn remove_all(session: &mut Session, path: &str, uid_validity: Option<u32>, target: Option<&str>) -> Result<()> {
+    select_checked(session, path, uid_validity).await?;
+    let uids = search_uids(session, "ALL").await?;
+    for batch in uids.chunks(CHANGE_BATCH) {
+        match target {
+            Some(target) => move_selected(session, batch, target).await?,
+            None => remove_by_uid(session, batch).await?,
+        }
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn makes_a_search_command_for_sender_or_subject() {
+        assert_eq!(search_query("ana"), Some("OR FROM \"ana\" SUBJECT \"ana\"".to_string()));
+        assert_eq!(search_query("  ana   order "), Some("OR FROM \"ana\" SUBJECT \"ana\" OR FROM \"order\" SUBJECT \"order\"".to_string()));
+        assert_eq!(search_query("   "), None);
+    }
+
+    #[test]
+    fn search_text_cannot_leave_its_quoted_string() {
+        /* A quote and a backslash are escaped, so they stay inside the string. */
+        assert_eq!(search_query("a\"b\\c"), Some("OR FROM \"a\\\"b\\\\c\" SUBJECT \"a\\\"b\\\\c\"".to_string()));
+        /* A line end would start a second command to the server: it is removed. */
+        let query = search_query("x\r\nA1 DELETE INBOX\u{0}").unwrap();
+        assert!(!query.chars().any(char::is_control));
+        /* Text that is not ASCII names its character set. */
+        assert_eq!(search_query("café"), Some("CHARSET UTF-8 OR FROM \"café\" SUBJECT \"café\"".to_string()));
+    }
 
     #[test]
     fn finds_folder_roles() {

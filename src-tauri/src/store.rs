@@ -111,6 +111,19 @@ pub struct Store {
     connection: Mutex<Connection>,
 }
 
+/** Stores one message header, or replaces the stored one with the same number. */
+fn store_header(transaction: &rusqlite::Transaction<'_>, folder_id: i64, header: &MessageHeader) -> Result<()> {
+    transaction.execute(
+        "INSERT INTO messages (folder_id, uid, subject, from_name, from_address, date, seen, flagged, size)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
+         ON CONFLICT (folder_id, uid) DO UPDATE SET
+           subject = excluded.subject, from_name = excluded.from_name, from_address = excluded.from_address,
+           date = excluded.date, seen = excluded.seen, flagged = excluded.flagged, size = excluded.size",
+        params![folder_id, header.uid, header.subject, header.from_name, header.from_address, header.date, header.seen, header.flagged, header.size],
+    )?;
+    Ok(())
+}
+
 impl Store {
     pub fn open(path: &Path) -> Result<Self> {
         if let Some(folder) = path.parent() {
@@ -251,14 +264,22 @@ impl Store {
             )?;
         }
         for header in headers {
-            transaction.execute(
-                "INSERT INTO messages (folder_id, uid, subject, from_name, from_address, date, seen, flagged, size)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
-                 ON CONFLICT (folder_id, uid) DO UPDATE SET
-                   subject = excluded.subject, from_name = excluded.from_name, from_address = excluded.from_address,
-                   date = excluded.date, seen = excluded.seen, flagged = excluded.flagged, size = excluded.size",
-                params![folder_id, header.uid, header.subject, header.from_name, header.from_address, header.date, header.seen, header.flagged, header.size],
-            )?;
+            store_header(&transaction, folder_id, header)?;
+        }
+        transaction.commit()?;
+        Ok(())
+    }
+
+    /**
+     * Stores more messages of a folder (older ones, or the results of a
+     * search), so that they can be opened, marked and deleted the same as
+     * the newest ones. No stored message is removed.
+     */
+    pub fn add_messages(&self, folder_id: i64, headers: &[MessageHeader]) -> Result<()> {
+        let mut connection = self.lock();
+        let transaction = connection.transaction()?;
+        for header in headers {
+            store_header(&transaction, folder_id, header)?;
         }
         transaction.commit()?;
         Ok(())
@@ -293,6 +314,86 @@ impl Store {
             .query_row("SELECT size FROM messages WHERE folder_id = ?1 AND uid = ?2", params![folder_id, uid], |row| row.get(0))
             .optional()?
             .context("the message is not in the list. Refresh the folder.")
+    }
+
+    /** The account's folder with a well-known use, for example "trash". */
+    pub fn folder_with_role(&self, account_id: i64, role: &str) -> Result<Option<Folder>> {
+        Ok(self
+            .lock()
+            .query_row(
+                "SELECT id, account_id, path, name, depth, role, selectable, unread, total FROM folders WHERE account_id = ?1 AND role = ?2 AND selectable ORDER BY id LIMIT 1",
+                params![account_id, role],
+                folder_from_row,
+            )
+            .optional()?)
+    }
+
+    /** Marks stored messages as read or as unread, and keeps the folder's unread count correct. */
+    pub fn mark_seen(&self, folder_id: i64, uids: &[u32], seen: bool) -> Result<()> {
+        let mut connection = self.lock();
+        let transaction = connection.transaction()?;
+        let mut changed = 0_i64;
+        for uid in uids {
+            changed += transaction.execute("UPDATE messages SET seen = ?3 WHERE folder_id = ?1 AND uid = ?2 AND seen != ?3", params![folder_id, uid, seen])? as i64;
+        }
+        let change = if seen { -changed } else { changed };
+        transaction.execute("UPDATE folders SET unread = MAX(0, unread + ?2) WHERE id = ?1", params![folder_id, change])?;
+        transaction.commit()?;
+        Ok(())
+    }
+
+    /** Marks all stored messages of a folder as read, after the server did the same. The unread count becomes 0. */
+    pub fn mark_all_seen(&self, folder_id: i64) -> Result<()> {
+        let mut connection = self.lock();
+        let transaction = connection.transaction()?;
+        transaction.execute("UPDATE messages SET seen = 1 WHERE folder_id = ?1", [folder_id])?;
+        transaction.execute("UPDATE folders SET unread = 0 WHERE id = ?1", [folder_id])?;
+        transaction.commit()?;
+        Ok(())
+    }
+
+    /**
+     * Removes all stored messages of a folder after the server moved or
+     * deleted them. The folder counts become 0. `moved_to` is the folder
+     * that the server moved them to; its counts go up by the same numbers.
+     */
+    pub fn remove_all_messages(&self, folder_id: i64, moved_to: Option<i64>) -> Result<()> {
+        let mut connection = self.lock();
+        let transaction = connection.transaction()?;
+        let (total, unread): (i64, i64) = transaction.query_row("SELECT total, unread FROM folders WHERE id = ?1", [folder_id], |row| Ok((row.get(0)?, row.get(1)?)))?;
+        transaction.execute("DELETE FROM messages WHERE folder_id = ?1", [folder_id])?;
+        transaction.execute("UPDATE folders SET total = 0, unread = 0 WHERE id = ?1", [folder_id])?;
+        if let Some(target) = moved_to {
+            transaction.execute("UPDATE folders SET total = total + ?2, unread = unread + ?3 WHERE id = ?1", params![target, total, unread])?;
+        }
+        transaction.commit()?;
+        Ok(())
+    }
+
+    /**
+     * Removes stored messages after the server moved or deleted them, and
+     * keeps the folder counts correct. `moved_to` is the folder that the
+     * server moved them to; its counts go up by the same numbers.
+     */
+    pub fn remove_messages(&self, folder_id: i64, uids: &[u32], moved_to: Option<i64>) -> Result<()> {
+        let mut connection = self.lock();
+        let transaction = connection.transaction()?;
+        let mut removed = 0_i64;
+        let mut unread = 0_i64;
+        for uid in uids {
+            let seen: Option<bool> = transaction.query_row("SELECT seen FROM messages WHERE folder_id = ?1 AND uid = ?2", params![folder_id, uid], |row| row.get(0)).optional()?;
+            if let Some(seen) = seen {
+                transaction.execute("DELETE FROM messages WHERE folder_id = ?1 AND uid = ?2", params![folder_id, uid])?;
+                removed += 1;
+                unread += i64::from(!seen);
+            }
+        }
+        transaction.execute("UPDATE folders SET total = MAX(0, total - ?2), unread = MAX(0, unread - ?3) WHERE id = ?1", params![folder_id, removed, unread])?;
+        if let Some(target) = moved_to {
+            transaction.execute("UPDATE folders SET total = total + ?2, unread = unread + ?3 WHERE id = ?1", params![target, removed, unread])?;
+        }
+        transaction.commit()?;
+        Ok(())
     }
 
     /** The newest messages of a folder first. */
@@ -407,6 +508,35 @@ mod tests {
         let store = Store::prepare(connection).unwrap();
         store.set_sender_trusted("a@example.com", true).unwrap();
         assert!(store.is_sender_trusted("a@example.com").unwrap());
+    }
+
+    #[test]
+    fn marks_messages_and_moves_them_with_correct_counts() {
+        let store = Store::open_in_memory().unwrap();
+        let account = store.add_account("gmail", "me@example.com", "imap.gmail.com", 993).unwrap();
+        let mut inbox = folder("INBOX", "inbox");
+        inbox.unread = 3;
+        inbox.total = 3;
+        let mut trash = folder("Trash", "trash");
+        trash.unread = 0;
+        trash.total = 5;
+        store.replace_folders(account.id, &[inbox, trash]).unwrap();
+        let inbox = store.folder_with_role(account.id, "inbox").unwrap().unwrap().id;
+        let trash = store.folder_with_role(account.id, "trash").unwrap().unwrap().id;
+        assert!(store.folder_with_role(account.id, "junk").unwrap().is_none());
+        store.save_messages(inbox, Some(1), 1, &[header(1, 100), header(2, 200), header(3, 300)]).unwrap();
+
+        store.mark_seen(inbox, &[1, 2], true).unwrap();
+        store.mark_seen(inbox, &[2], true).unwrap();
+        assert_eq!(store.folder(inbox).unwrap().unread, 1);
+        store.mark_seen(inbox, &[2], false).unwrap();
+        assert_eq!(store.folder(inbox).unwrap().unread, 2);
+        assert!(!store.messages(inbox, 50).unwrap().iter().find(|message| message.uid == 2).unwrap().seen);
+
+        store.remove_messages(inbox, &[1, 2, 99], Some(trash)).unwrap();
+        let (inbox, trash) = (store.folder(inbox).unwrap(), store.folder(trash).unwrap());
+        assert_eq!((inbox.total, inbox.unread), (1, 1));
+        assert_eq!((trash.total, trash.unread), (7, 1));
     }
 
     #[test]

@@ -376,7 +376,7 @@ fn page(body: &str) -> String {
     format!("{PAGE_START}{body}{PAGE_END}")
 }
 
-fn address_list(address: Option<&Address<'_>>) -> String {
+pub fn address_list(address: Option<&Address<'_>>) -> String {
     let Some(address) = address else { return String::new() };
     address
         .iter()

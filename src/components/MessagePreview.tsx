@@ -1,12 +1,19 @@
-import { CircleNotch, Paperclip, ShieldCheck, Warning, WarningCircle } from "@phosphor-icons/react";
+import { ArrowBendDoubleUpLeft, ArrowBendUpLeft, ArrowBendUpRight, CircleNotch, Envelope, Paperclip, ShieldCheck, Trash, Warning, WarningCircle } from "@phosphor-icons/react";
 import { useCallback, useEffect, useRef, useState } from "react";
-import { checkLink, formatFileSize, openMessage, saveAttachment, setSenderTrusted, type AttachmentInfo, type LinkCheck, type MessageHeader, type MessageView } from "../lib/mail";
+import { checkLink, formatFileSize, openMessage, saveAttachment, setSenderTrusted, type AttachmentInfo, type LinkCheck, type MessageHeader, type MessageView, type ReplyMode } from "../lib/mail";
 import { ConfirmDialog } from "./ConfirmDialog";
 import { LinkDialog } from "./LinkDialog";
 
 interface Props {
   folderId: number;
   message: MessageHeader;
+  /** True when the message is in the trash folder: Delete then deletes for good. */
+  inTrash: boolean;
+  /** Called one time when the message text shows. The message then becomes "read". */
+  onOpened: () => void;
+  onMarkUnread: () => void;
+  onReply: (mode: ReplyMode) => void;
+  onDelete: () => void;
 }
 
 type Notice = { kind: "info" | "error"; text: string };
@@ -19,7 +26,7 @@ type Notice = { kind: "info" | "error"; text: string };
  * It has "allow-same-origin" only so that this component can catch a click
  * on a link; a link never opens by the click alone.
  */
-export function MessagePreview({ folderId, message }: Props) {
+export function MessagePreview({ folderId, message, inTrash, onOpened, onMarkUnread, onReply, onDelete }: Props) {
   const [view, setView] = useState<MessageView | null>(null);
   const [busy, setBusy] = useState(true);
   const [error, setError] = useState<string | null>(null);
@@ -29,6 +36,18 @@ export function MessagePreview({ folderId, message }: Props) {
   /** The message that this pane shows. An answer for a different message is old, and is ignored. */
   const shown = useRef("");
   const key = `${folderId}:${message.uid}`;
+  /** The message that was reported as opened, so that each message is reported one time only. */
+  const reported = useRef("");
+  const onOpenedRef = useRef(onOpened);
+  onOpenedRef.current = onOpened;
+
+  /* A message becomes "read" when its text shows, not when the user only selects it. */
+  useEffect(() => {
+    if (view && shown.current === key && reported.current !== key) {
+      reported.current = key;
+      onOpenedRef.current();
+    }
+  }, [view, key]);
 
   const load = useCallback(async (loadRemote: boolean) => {
     const current = () => shown.current === key;
@@ -100,26 +119,27 @@ export function MessagePreview({ folderId, message }: Props) {
   return (
     <section className="pane preview-pane" aria-label="Secure preview">
       <header className="preview-header">
+        <div className="preview-actions">
+          <button className="icon-button" onClick={() => onReply("reply")} disabled={!view} aria-label="Reply" title="Reply"><ArrowBendUpLeft size={16} /></button>
+          <button className="icon-button" onClick={() => onReply("reply_all")} disabled={!view} aria-label="Reply to all" title="Reply to all"><ArrowBendDoubleUpLeft size={16} /></button>
+          <button className="icon-button" onClick={() => onReply("forward")} disabled={!view} aria-label="Forward" title="Forward"><ArrowBendUpRight size={16} /></button>
+          <button className="icon-button" onClick={onMarkUnread} disabled={!message.seen} aria-label="Mark as unread" title="Mark as unread"><Envelope size={16} /></button>
+          <button className="icon-button" onClick={onDelete} aria-label={inTrash ? "Delete for good" : "Delete"} title={inTrash ? "Delete for good" : "Delete (Del)"}><Trash size={16} /></button>
+        </div>
         <h2 className="preview-subject selectable">{(view?.subject ?? message.subject) || "(no subject)"}</h2>
         <dl className="preview-fields selectable">
           <div className="preview-line">
             <dt>From</dt>
-            <dd><strong>{sender || "(no sender)"}</strong>{senderAddress && sender !== senderAddress ? ` <${senderAddress}>` : ""}</dd>
+            <dd className="preview-sender"><strong>{sender || "(no sender)"}</strong>{senderAddress && sender !== senderAddress ? ` <${senderAddress}>` : ""}</dd>
           </div>
-          {view?.to && <div className="preview-line"><dt>To</dt><dd>{view.to}</dd></div>}
-          {view?.cc && <div className="preview-line"><dt>Cc</dt><dd>{view.cc}</dd></div>}
+          {view?.to && <div className="preview-line"><dt>To</dt><dd className="preview-recipient">{view.to}</dd></div>}
+          {view?.cc && <div className="preview-line"><dt>Cc</dt><dd className="preview-recipient">{view.cc}</dd></div>}
         </dl>
         {message.date > 0 && <div className="preview-date">{new Date(message.date * 1000).toLocaleString()}</div>}
       </header>
 
       {error && (
         <div className="preview-bar error"><WarningCircle size={15} weight="fill" /><span className="selectable">{error}</span></div>
-      )}
-      {view && view.blocked_trackers > 0 && (
-        <div className="preview-bar">
-          <ShieldCheck size={15} weight="fill" />
-          <span>Mail Sage removed {view.blocked_trackers} tracking {view.blocked_trackers === 1 ? "image" : "images"}. These never load.</span>
-        </div>
       )}
       {view && view.blocked_images > 0 && !view.remote_loaded && (
         <div className="preview-bar">

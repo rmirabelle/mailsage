@@ -5,6 +5,7 @@ import {
   CircleNotch,
   File,
   Folder as FolderIcon,
+  NotePencil,
   PaperPlaneTilt,
   Plus,
   Star,
@@ -25,7 +26,10 @@ interface Props {
   /** The last folder-list error of each account. */
   accountErrors: ReadonlyMap<number, string>;
   onSelectFolder: (folder: Folder) => void;
+  /** A right-click on a folder: open its menu at the mouse. */
+  onFolderMenu: (folder: Folder, position: { left: number; top: number }) => void;
   onAddAccount: () => void;
+  onNewMessage: () => void;
   onRefreshAccount: (account: Account) => void;
   onRemoveAccount: (account: Account) => void;
 }
@@ -43,7 +47,7 @@ const ROLE_ICONS: Record<FolderRole, ReactNode> = {
 };
 
 /** The left pane: one group for each account, with its folders and unread counts. */
-export function AccountsPane({ accounts, selectedFolderId, busyAccountIds, accountErrors, onSelectFolder, onAddAccount, onRefreshAccount, onRemoveAccount }: Props) {
+export function AccountsPane({ accounts, selectedFolderId, busyAccountIds, accountErrors, onSelectFolder, onFolderMenu, onAddAccount, onNewMessage, onRefreshAccount, onRemoveAccount }: Props) {
   const [collapsed, setCollapsed] = useState<ReadonlySet<number>>(new Set());
 
   const toggle = (accountId: number) => {
@@ -58,9 +62,16 @@ export function AccountsPane({ accounts, selectedFolderId, busyAccountIds, accou
     <aside className="pane accounts-pane" aria-label="Accounts">
       <div className="pane-heading-row">
         <h2 className="pane-heading">Accounts</h2>
-        <button className="icon-button" onClick={onAddAccount} aria-label="Add account" title="Add account">
-          <Plus size={15} />
-        </button>
+        <span className="pane-heading-buttons">
+          {accounts.length > 0 && (
+            <button className="icon-button" onClick={onNewMessage} aria-label="New message" title="New message (Ctrl+N)">
+              <NotePencil size={15} />
+            </button>
+          )}
+          <button className="icon-button" onClick={onAddAccount} aria-label="Add account" title="Add account">
+            <Plus size={15} />
+          </button>
+        </span>
       </div>
       {accounts.length === 0 ? (
         <div className="pane-empty">
@@ -102,6 +113,10 @@ export function AccountsPane({ accounts, selectedFolderId, busyAccountIds, accou
                     style={{ paddingLeft: 26 + folder.depth * 14 }}
                     disabled={!folder.selectable}
                     onClick={() => onSelectFolder(folder)}
+                    onContextMenu={(event) => {
+                      event.preventDefault();
+                      if (folder.selectable) onFolderMenu(folder, { left: event.clientX, top: event.clientY });
+                    }}
                   >
                     {ROLE_ICONS[folder.role] ?? ROLE_ICONS.other}
                     <span className="folder-name">{folder.name}</span>

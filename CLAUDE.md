@@ -33,8 +33,25 @@ order of work.
   before it opens. `remote.rs` fetches remote images (only when the user
   asks, never from the local network). `src/components/MessagePreview.tsx`
   shows the page in a frame that cannot run scripts.
+- `src-tauri/src/compose.rs` builds and sends a message (plain text, SMTP
+  on port 465) and makes the starting text of a reply or a forward. A sent
+  message must not name the mail program or the computer. Only files that
+  the user picked in the "Attach" dialog can go out (`AppState::picked_files`).
+- Delete moves a message to the account's trash folder. Only a message that
+  is in the trash already is deleted for good, and the window asks first.
 - Message bodies are not written to the disk. The last few opened messages
   stay in memory (`AppState::opened` in `accounts.rs`).
+- `src/components/MessageList.tsx` shows day groups, and only the latest
+  message of each sender; the older ones are in a block under it. Its search
+  box filters the list, and also searches the full folder on the server
+  (`imap::search_query` makes the command; the text is from the user, so keep
+  its quoting and its tests). "Load older emails" reads the next messages.
+- User settings (`src/lib/settings.ts`) and column widths (`src/lib/panes.ts`)
+  are saved in the webview's local storage. Add a new setting with a default,
+  and show it in `src/components/SettingsDialog.tsx` (File > Settings).
+- A right-click on a folder gives "Mark all as read" and "Delete all" (or
+  "Empty Trash"). These change the full folder on the server, and "Delete
+  all" always asks first with the number of emails.
 - `src-tauri/build.rs` reads the sign-in client values from the environment
   or from the gitignored `secrets/oauth.env`; the code embeds them with
   `obfstr`. `docs/GOOGLE-SETUP.md` has the registration steps.
