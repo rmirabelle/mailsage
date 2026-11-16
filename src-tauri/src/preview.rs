@@ -61,7 +61,7 @@ const TRACKER_MAX_SIZE: f32 = 2.0;
 const PAGE_START: &str = "<!doctype html><html><head><meta charset=\"utf-8\">\
 <meta http-equiv=\"Content-Security-Policy\" content=\"default-src 'none'; img-src data:; style-src 'unsafe-inline'\">\
 <meta name=\"referrer\" content=\"no-referrer\">\
-<style>html{background:#fff}body{margin:16px;color:#1b1b1f;background:#fff;font:14px/1.5 'Segoe UI',system-ui,sans-serif;overflow-wrap:anywhere}\
+<style>html{background:#fff;scrollbar-width:thin;scrollbar-color:#4a4f61 #1d2029}body{margin:16px;color:#1b1b1f;background:#fff;font:14px/1.5 'Segoe UI',system-ui,sans-serif;overflow-wrap:anywhere}\
 img{max-width:100%;height:auto}pre{white-space:pre-wrap;font:inherit;margin:0}a{color:#1a56c4}</style></head><body>";
 const PAGE_END: &str = "</body></html>";
 
