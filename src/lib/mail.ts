@@ -34,6 +34,10 @@ export type MessageHeader = {
 };
 
 export const googleSignInReady = () => invoke<boolean>("google_sign_in_ready");
+/** True when this build can sign in to Microsoft: with `work`, to a work or school account (Microsoft 365); without it, to a personal account. */
+export const microsoftSignInReady = (work: boolean) => invoke<boolean>("microsoft_sign_in_ready", { work });
+/** Opens the Microsoft sign-in in the browser. It resolves when the sign-in is complete. */
+export const addMicrosoftAccount = (work: boolean) => invoke<Omit<Account, "folders">>("add_microsoft_account", { work });
 export const listAccounts = () => invoke<Account[]>("list_accounts");
 /** Opens the Google sign-in in the browser. It resolves when the sign-in is complete. */
 export const addGmailAccount = () => invoke<Omit<Account, "folders">>("add_gmail_account");
@@ -71,6 +75,64 @@ export function searchMessages(messages: MessageHeader[], text: string): Message
     const content = `${message.from_name}\n${message.from_address}\n${message.subject}`.toLowerCase();
     return words.every((word) => content.includes(word));
   });
+}
+
+/** Puts the star on messages, or removes it. Resolves with the account's folders and their new counts. */
+export const setMessagesFlagged = (folderId: number, uids: number[], flagged: boolean) => invoke<Folder[]>("set_messages_flagged", { folderId, uids, flagged });
+/** Moves messages to a different folder of the same account. Resolves with the account's folders and their new counts. */
+export const moveMessagesTo = (folderId: number, uids: number[], targetId: number) => invoke<Folder[]>("move_messages_to", { folderId, uids, targetId });
+/** Deletes a folder that the user made, on the server. Resolves with the account's folders after that. */
+export const deleteFolder = (folderId: number) => invoke<Folder[]>("delete_folder", { folderId });
+/** Moves messages from the Junk folder to the inbox ("Not junk"). Resolves with the account's folders and their new counts. */
+export const moveToInbox = (folderId: number, uids: number[]) => invoke<Folder[]>("move_to_inbox", { folderId, uids });
+/** The block list: addresses, and domains with the at sign in front. */
+export const listBlocked = () => invoke<string[]>("list_blocked");
+/**
+ * Blocks a sender address (`ann@example.com`) or a sender domain (`@example.com`).
+ * When the folder is an inbox, its messages from that sender move to the Junk
+ * folder at once; `removed` has their numbers.
+ */
+export const blockSender = (entry: string, folderId: number) => invoke<{ folders: Folder[]; removed: number[] }>("block_sender", { entry, folderId });
+/** Adds an entry to the block list from the settings. Resolves with the entry in its clean form. */
+export const addBlocked = (entry: string) => invoke<string>("add_blocked", { entry });
+export const unblockSender = (entry: string) => invoke<void>("unblock_sender", { entry });
+
+/** The domain of an address with the at sign in front (`@example.com`), or an empty text when the address has no domain. */
+export function senderDomain(address: string): string {
+  const at = address.lastIndexOf("@");
+  return at >= 0 && at < address.length - 1 ? address.slice(at).toLowerCase() : "";
+}
+
+/** The messages from a block list entry: a sender address, or a domain with the at sign in front. */
+export function messagesFromBlocked(messages: MessageHeader[], entry: string): MessageHeader[] {
+  const wanted = entry.trim().toLowerCase();
+  return messages.filter((message) => {
+    const address = message.from_address.trim().toLowerCase();
+    return wanted.startsWith("@") ? senderDomain(address) === wanted : address === wanted;
+  });
+}
+
+/**
+ * The number of addresses in a list such as `Ann <ann@example.com>, bob@example.com`.
+ * A comma or a semicolon that is in quotes or in angle brackets does not divide the list.
+ */
+export function countAddresses(list: string): number {
+  let count = 0;
+  let current = "";
+  let inQuotes = false;
+  let inBrackets = false;
+  for (const character of `${list},`) {
+    if (character === '"') inQuotes = !inQuotes;
+    else if (character === "<" && !inQuotes) inBrackets = true;
+    else if (character === ">" && !inQuotes) inBrackets = false;
+    else if ((character === "," || character === ";") && !inQuotes && !inBrackets) {
+      if (current.trim() !== "") count += 1;
+      current = "";
+      continue;
+    }
+    current += character;
+  }
+  return count;
 }
 
 const DAY_SECONDS = 86400;

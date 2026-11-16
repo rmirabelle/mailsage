@@ -1,24 +1,34 @@
 import { isTauri } from "@tauri-apps/api/core";
-import { ArrowBendDoubleUpLeft, ArrowBendUpLeft, ArrowBendUpRight, Checks, Envelope, EnvelopeOpen, ShieldCheck, Trash } from "@phosphor-icons/react";
+import { ArrowBendDoubleUpLeft, ArrowBendUpLeft, ArrowBendUpRight, ArrowsClockwise, Checks, Envelope, EnvelopeOpen, Eye, EyeSlash, FolderMinus, FolderSimple, PencilSimple, Prohibit, ShieldCheck, Star, Trash, Tray, X } from "@phosphor-icons/react";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { AboutDialog } from "./components/AboutDialog";
 import { AccountsPane } from "./components/AccountsPane";
 import { AddAccountDialog } from "./components/AddAccountDialog";
+import { BlockDialog } from "./components/BlockDialog";
 import { ComposeDialog } from "./components/ComposeDialog";
 import { ConfirmDialog } from "./components/ConfirmDialog";
 import { DeleteDialog } from "./components/DeleteDialog";
 import { ContextMenu, type MenuItem } from "./components/ContextMenu";
 import { MenuBar, type Menu } from "./components/MenuBar";
 import { MessageList } from "./components/MessageList";
+import { LabelDialog } from "./components/LabelDialog";
+import { MoveDialog } from "./components/MoveDialog";
 import { MessagePreview } from "./components/MessagePreview";
 import { PaneDivider } from "./components/PaneDivider";
-import { SettingsDialog } from "./components/SettingsDialog";
+import { loadAccountLabels, saveAccountLabels, withAccountLabel, type AccountLabels } from "./lib/accountLabels";
+import { folderKey, loadHiddenFolders, saveHiddenFolders } from "./lib/folders";
+import { SettingsDialog, type SettingsCategory } from "./components/SettingsDialog";
 import { TitleBar } from "./components/TitleBar";
 import {
   deleteFolderMessages,
   deleteMessages,
   listAccounts,
+  blockSender,
+  deleteFolder,
   listMessages,
+  messagesFromBlocked,
+  moveMessagesTo,
+  moveToInbox,
   loadOlderMessages,
   markFolderSeen,
   olderFromSender,
@@ -26,6 +36,8 @@ import {
   removeAccount,
   replyDraft,
   searchFolder,
+  setMessagesFlagged,
+  senderDomain,
   setMessagesSeen,
   syncFolders,
   syncMessages,
@@ -59,6 +71,9 @@ export default function App() {
   const [startupUpdate, setStartupUpdate] = useState<UpdateInfo | null>(null);
   const [aboutOpen, setAboutOpen] = useState(false);
   const [settingsOpen, setSettingsOpen] = useState(false);
+  /** The settings category that shows when the settings open. */
+  const [settingsCategory, setSettingsCategory] = useState<SettingsCategory>("emails");
+  const openSettings = (category: SettingsCategory) => { setSettingsCategory(category); setSettingsOpen(true); };
   const [settings, setSettings] = useState<Settings>(loadSettings);
   const changeSettings = (next: Settings) => {
     setSettings(next);
@@ -71,6 +86,34 @@ export default function App() {
   const [folderMenu, setFolderMenu] = useState<{ folder: Folder; position: { left: number; top: number } } | null>(null);
   /** A folder that waits for the "delete all" answer of the user. */
   const [folderToEmpty, setFolderToEmpty] = useState<Folder | null>(null);
+  /** The labels that the user gave to accounts in the accounts list. This is saved. */
+  const [accountLabels, setAccountLabels] = useState<AccountLabels>(loadAccountLabels);
+  const [accountMenu, setAccountMenu] = useState<{ account: Account; position: { left: number; top: number } } | null>(null);
+  /** The account whose label the user changes. */
+  const [accountToLabel, setAccountToLabel] = useState<Account | null>(null);
+  const setAccountLabel = (account: Account, label: string) => {
+    setAccountLabels((current) => {
+      const next = withAccountLabel(current, account.id, label);
+      saveAccountLabels(next);
+      return next;
+    });
+  };
+  /** The folder that the user wants to delete from the server. The user must confirm it first. */
+  const [folderToDelete, setFolderToDelete] = useState<Folder | null>(null);
+  /** The folders that the user hid in the accounts column. This is saved. The folders stay on the server. */
+  const [hiddenFolders, setHiddenFolders] = useState<ReadonlySet<string>>(loadHiddenFolders);
+  /** True while the hidden folders show also, so that the user can show one again. */
+  const [showHidden, setShowHidden] = useState(false);
+  const setFolderHidden = (folder: Folder, hidden: boolean) => {
+    setHiddenFolders((current) => {
+      const next = new Set(current);
+      if (hidden) next.add(folderKey(folder)); else next.delete(folderKey(folder));
+      saveHiddenFolders(next);
+      return next;
+    });
+  };
+  /** The sender address, or the domain with the at sign in front, that the user wants to block. The user must confirm it first. */
+  const [entryToBlock, setEntryToBlock] = useState<string | null>(null);
   /** A message in the trash that waits for the user's "delete for good" answer. */
   const [messageToDestroy, setMessageToDestroy] = useState<MessageHeader | null>(null);
   /** A message that waits for the answer of the user, because its sender has older messages in the folder. */
@@ -128,6 +171,27 @@ export default function App() {
     [accounts, selectedFolderId]
   );
   const selectedMessage = useMemo(() => messages.find((message) => message.uid === selectedUid) ?? null, [messages, selectedUid]);
+  /**
+   * The other selected messages (Shift or Ctrl with a click). The preview
+   * shows only `selectedUid`. An action on the selection uses the two.
+   */
+  const [extraUids, setExtraUids] = useState<ReadonlySet<number>>(new Set());
+  /** All selected messages, in the order of the list. With one selected message, this has that one. */
+  const selection = useMemo(() => messages.filter((message) => message.uid === selectedUid || extraUids.has(message.uid)), [messages, selectedUid, extraUids]);
+  /* A message that left the list, and the selection of a different folder, go out of the selection. */
+  useEffect(() => {
+    setExtraUids((current) => {
+      if (current.size === 0) return current;
+      const present = new Set(messages.map((message) => message.uid));
+      const next = new Set([...current].filter((uid) => present.has(uid) && uid !== selectedUid));
+      return next.size === current.size ? current : next;
+    });
+  }, [messages, selectedUid]);
+  useEffect(() => setExtraUids(new Set()), [selectedFolderId]);
+  /** The messages that the user wants to delete as a group. The user must confirm it first. */
+  const [messagesToDelete, setMessagesToDelete] = useState<MessageHeader[] | null>(null);
+  /** The messages that the user wants to move. The user selects the folder in a dialog. */
+  const [messagesToMove, setMessagesToMove] = useState<MessageHeader[] | null>(null);
   /** The message list as it is now, for actions that must not wait for the next render. */
   const messagesRef = useRef(messages);
   messagesRef.current = messages;
@@ -312,6 +376,29 @@ export default function App() {
   }, []);
 
   /**
+   * Puts the star on a message, or removes it. The list changes at once; if
+   * the server refuses, the list goes back and the error shows. In the
+   * folder of starred messages, a message without the star leaves the list.
+   */
+  const setStar = useCallback(async (folder: Folder, message: MessageHeader, flagged: boolean) => {
+    if (message.flagged === flagged) return;
+    setMessagesError(null);
+    const before = messagesRef.current;
+    if (shownFolderId.current === folder.id) {
+      const leaves = folder.role === "flagged" && !flagged;
+      setMessages(leaves ? before.filter((entry) => entry.uid !== message.uid) : before.map((entry) => entry.uid === message.uid ? { ...entry, flagged } : entry));
+      if (leaves) setSelectedUid((selected) => selected === message.uid ? null : selected);
+    }
+    try {
+      setAccountFolders(folder.account_id, await setMessagesFlagged(folder.id, [message.uid], flagged));
+    } catch (error) {
+      if (shownFolderId.current !== folder.id) return;
+      setMessages(before);
+      setMessagesError(String(error));
+    }
+  }, []);
+
+  /**
    * Deletes a message, and with it the `others` (older messages from the
    * same sender). The messages leave the list at once and the message under
    * the deleted one becomes selected; the server does the delete after that.
@@ -367,8 +454,102 @@ export default function App() {
     }
   }, []);
 
+  /** Deletes a folder on the server. When the list shows that folder, the list becomes empty. */
+  const removeFolder = async (folder: Folder) => {
+    setAccountBusy(folder.account_id, true);
+    setAccountError(folder.account_id, null);
+    try {
+      setAccountFolders(folder.account_id, await deleteFolder(folder.id));
+      setFolderHidden(folder, false);
+      if (shownFolderId.current === folder.id) {
+        shownFolderId.current = null;
+        setSelectedFolderId(null);
+        setMessages([]);
+        setSelectedUid(null);
+        setMessagesError(null);
+      }
+    } catch (error) {
+      setAccountError(folder.account_id, String(error));
+    } finally {
+      setAccountBusy(folder.account_id, false);
+    }
+  };
+
   const markAllRead = (folder: Folder) => void changeFolder(folder, markFolderSeen, (current) => current.map((message) => message.seen ? message : { ...message, seen: true }));
   const deleteAll = (folder: Folder) => void changeFolder(folder, deleteFolderMessages, () => []);
+
+  /** Moves messages to a different folder of the account. The server does the move, and then the messages leave the list. */
+  const moveMessages = useCallback(async (folder: Folder, moved: MessageHeader[], target: Folder) => {
+    setMessagesError(null);
+    const uids = new Set(moved.map((message) => message.uid));
+    try {
+      setAccountFolders(folder.account_id, await moveMessagesTo(folder.id, [...uids], target.id));
+      if (shownFolderId.current !== folder.id) return;
+      setMessages(messagesRef.current.filter((message) => !uids.has(message.uid)));
+      setSelectedUid((selected) => selected !== null && uids.has(selected) ? null : selected);
+    } catch (error) {
+      setMessagesError(String(error));
+    }
+  }, []);
+
+  /** Marks a group of messages as read or as unread. The server does the change, and then the list shows it. */
+  const markManySeen = useCallback(async (folder: Folder, marked: MessageHeader[], seen: boolean) => {
+    setMessagesError(null);
+    const uids = new Set(marked.filter((message) => message.seen !== seen).map((message) => message.uid));
+    if (uids.size === 0) return;
+    try {
+      setAccountFolders(folder.account_id, await setMessagesSeen(folder.id, [...uids], seen));
+      if (shownFolderId.current === folder.id) setMessages(messagesRef.current.map((message) => uids.has(message.uid) ? { ...message, seen } : message));
+    } catch (error) {
+      setMessagesError(String(error));
+    }
+  }, []);
+
+  /** "Not junk": the server moves a message from the Junk folder to the inbox, and then the message leaves the list. */
+  const notJunk = useCallback(async (folder: Folder, message: MessageHeader) => {
+    setMessagesError(null);
+    try {
+      setAccountFolders(folder.account_id, await moveToInbox(folder.id, [message.uid]));
+      if (shownFolderId.current !== folder.id) return;
+      const index = messagesRef.current.findIndex((entry) => entry.uid === message.uid);
+      const next = messagesRef.current.filter((entry) => entry.uid !== message.uid);
+      setMessages(next);
+      setSelectedUid((selected) => selected === message.uid ? (next[Math.min(Math.max(index, 0), next.length - 1)]?.uid ?? null) : selected);
+    } catch (error) {
+      setMessagesError(String(error));
+    }
+  }, []);
+
+  /**
+   * Blocks a sender address or a sender domain. With `deleteEmails`, the
+   * messages from that sender in the list are deleted first (they move to
+   * the trash). Then, in an inbox, the server moves the messages from that
+   * sender that remain to the Junk folder, and they leave the list.
+   */
+  const block = useCallback(async (folder: Folder, entry: string, deleteEmails: boolean) => {
+    setMessagesError(null);
+    try {
+      if (deleteEmails && shownFolderId.current === folder.id) {
+        const uids = new Set(messagesFromBlocked(messagesRef.current, entry).map((message) => message.uid));
+        if (uids.size > 0) {
+          setAccountFolders(folder.account_id, await deleteMessages(folder.id, [...uids]));
+          if (shownFolderId.current === folder.id) {
+            setMessages(messagesRef.current.filter((message) => !uids.has(message.uid)));
+            setSelectedUid((selected) => selected !== null && uids.has(selected) ? null : selected);
+          }
+        }
+      }
+      const outcome = await blockSender(entry, folder.id);
+      setAccountFolders(folder.account_id, outcome.folders);
+      if (shownFolderId.current !== folder.id || outcome.removed.length === 0) return;
+      const removed = new Set(outcome.removed);
+      const next = messagesRef.current.filter((message) => !removed.has(message.uid));
+      setMessages(next);
+      setSelectedUid((selected) => selected !== null && removed.has(selected) ? null : selected);
+    } catch (error) {
+      setMessagesError(String(error));
+    }
+  }, []);
 
   /**
    * Starts a delete. When the sender has older messages in the folder, the
@@ -400,13 +581,16 @@ export default function App() {
   }, [selectedFolder]);
 
   /* Keyboard: Delete removes the selected message; Ctrl+N starts a new message; Ctrl+comma opens the settings. Not while a dialog or a text field has the keys. */
-  const dialogOpen = aboutOpen || settingsOpen || addAccountOpen || accountToRemove !== null || compose !== null || messageToDestroy !== null || deleteQuestion !== null || folderToEmpty !== null;
+  const dialogOpen = aboutOpen || settingsOpen || addAccountOpen || accountToRemove !== null || compose !== null || messageToDestroy !== null || deleteQuestion !== null || folderToEmpty !== null || folderToDelete !== null || entryToBlock !== null || accountToLabel !== null || messagesToDelete !== null || messagesToMove !== null;
   useEffect(() => {
     const onKeyDown = (event: KeyboardEvent) => {
       if (dialogOpen) return;
       const target = event.target as HTMLElement | null;
       if (target?.closest("input, textarea, select, [contenteditable='true']")) return;
-      if (event.key === "Delete" && selectedMessage) {
+      if (event.key === "Delete" && selection.length > 1) {
+        event.preventDefault();
+        setMessagesToDelete(selection);
+      } else if (event.key === "Delete" && selectedMessage) {
         event.preventDefault();
         requestDelete(selectedMessage);
       } else if (event.ctrlKey && !event.shiftKey && !event.altKey && event.key.toLowerCase() === "n") {
@@ -414,18 +598,22 @@ export default function App() {
         startCompose();
       } else if (event.ctrlKey && !event.shiftKey && !event.altKey && event.key === ",") {
         event.preventDefault();
-        setSettingsOpen(true);
+        openSettings("emails");
       }
     };
     window.addEventListener("keydown", onKeyDown);
     return () => window.removeEventListener("keydown", onKeyDown);
-  }, [dialogOpen, selectedMessage, requestDelete, startCompose]);
+  }, [dialogOpen, selectedMessage, selection, requestDelete, startCompose]);
 
   const menus: Menu[] = [
     { id: "file", label: "File", items: [
       { label: "New message", shortcut: "Ctrl+N", disabled: accounts.length === 0, run: startCompose },
       { label: "Add account…", run: () => setAddAccountOpen(true) },
-      { label: "Settings…", shortcut: "Ctrl+,", run: () => setSettingsOpen(true) }
+      { label: "Blocked senders…", run: () => openSettings("blocked") },
+      { label: "Settings…", shortcut: "Ctrl+,", run: () => openSettings("emails") }
+    ] },
+    { id: "view", label: "View", items: [
+      { label: showHidden ? "Do not show hidden folders" : "Show hidden folders", disabled: hiddenFolders.size === 0 && !showHidden, run: () => setShowHidden((current) => !current) }
     ] },
     { id: "help", label: "Help", items: [{ label: "About Mail Sage", run: () => setAboutOpen(true) }] }
   ];
@@ -433,21 +621,61 @@ export default function App() {
   const messageMenuItems = (message: MessageHeader): MenuItem[] => {
     const folder = selectedFolder;
     if (!folder) return [];
+    /* A right-click on one of many selected messages gives the actions for the full selection. */
+    if (selection.length > 1 && selection.some((entry) => entry.uid === message.uid)) {
+      const count = selection.length;
+      return [
+        { label: `Mark ${count} emails as read`, icon: <EnvelopeOpen size={15} />, disabled: selection.every((entry) => entry.seen), run: () => void markManySeen(folder, selection, true) },
+        { label: `Mark ${count} emails as unread`, icon: <Envelope size={15} />, disabled: selection.every((entry) => !entry.seen), run: () => void markManySeen(folder, selection, false) },
+        { label: `Move ${count} emails to folder…`, icon: <FolderSimple size={15} />, run: () => setMessagesToMove(selection) },
+        { label: folder.role === "trash" ? `Delete ${count} emails for good…` : `Delete ${count} emails…`, icon: <Trash size={15} />, run: () => setMessagesToDelete(selection) }
+      ];
+    }
+    const address = message.from_address.trim().toLowerCase();
+    const domain = senderDomain(address);
+    /* The block uses the real address of the sender, so a message with no address has no block items. */
+    const blockItems: MenuItem[] = domain === "" ? [] : [
+      { label: `Block sender ${address}`, icon: <Prohibit size={15} />, run: () => setEntryToBlock(address) },
+      { label: `Block domain ${domain}`, icon: <Prohibit size={15} />, run: () => setEntryToBlock(domain) }
+    ];
+    const junkItems: MenuItem[] = folder.role === "junk"
+      ? [{ label: "Not junk", icon: <Tray size={15} />, run: () => void notJunk(folder, message) }]
+      : [];
     return [
+      ...junkItems,
       message.seen
         ? { label: "Mark as unread", icon: <Envelope size={15} />, run: () => void markSeen(folder, message, false) }
         : { label: "Mark as read", icon: <EnvelopeOpen size={15} />, run: () => void markSeen(folder, message, true) },
+      message.flagged
+        ? { label: "Remove star", icon: <Star size={15} />, run: () => void setStar(folder, message, false) }
+        : { label: "Add star", icon: <Star size={15} weight="fill" />, run: () => void setStar(folder, message, true) },
       { label: "Reply", icon: <ArrowBendUpLeft size={15} />, run: () => void startReply(message, "reply") },
       { label: "Reply to all", icon: <ArrowBendDoubleUpLeft size={15} />, run: () => void startReply(message, "reply_all") },
       { label: "Forward", icon: <ArrowBendUpRight size={15} />, run: () => void startReply(message, "forward") },
-      { label: folder.role === "trash" ? "Delete for good" : "Delete", icon: <Trash size={15} />, run: () => requestDelete(message) }
+      { label: "Move to folder…", icon: <FolderSimple size={15} />, run: () => setMessagesToMove([message]) },
+      { label: folder.role === "trash" ? "Delete for good" : "Delete", icon: <Trash size={15} />, run: () => requestDelete(message) },
+      ...blockItems
     ];
   };
 
-  const folderMenuItems = (folder: Folder): MenuItem[] => [
-    { label: "Mark all as read", icon: <Checks size={15} />, disabled: folder.unread === 0, run: () => markAllRead(folder) },
-    { label: folder.role === "trash" ? "Empty Trash…" : "Delete all…", icon: <Trash size={15} />, disabled: folder.total === 0, run: () => setFolderToEmpty(folder) }
+  const accountMenuItems = (account: Account): MenuItem[] => [
+    { label: "Set label…", icon: <PencilSimple size={15} />, run: () => setAccountToLabel(account) },
+    { label: "Refresh folders", icon: <ArrowsClockwise size={15} />, run: () => void refreshFolders(account.id) },
+    { label: "Remove account…", icon: <X size={15} />, run: () => setAccountToRemove(account) }
   ];
+
+  const folderMenuItems = (folder: Folder): MenuItem[] => {
+    const items: MenuItem[] = folder.selectable ? [
+      { label: "Mark all as read", icon: <Checks size={15} />, disabled: folder.unread === 0, run: () => markAllRead(folder) },
+      { label: folder.role === "trash" ? "Empty Trash…" : "Delete all…", icon: <Trash size={15} />, disabled: folder.total === 0, run: () => setFolderToEmpty(folder) }
+    ] : [];
+    /* The inbox always shows. Each other folder can go out of the list; it stays on the server. */
+    if (hiddenFolders.has(folderKey(folder))) items.push({ label: "Show folder", icon: <Eye size={15} />, run: () => setFolderHidden(folder, false) });
+    else if (folder.role !== "inbox") items.push({ label: "Hide folder", icon: <EyeSlash size={15} />, run: () => setFolderHidden(folder, true) });
+    /* Only a folder that the user made can be deleted. The well-known folders belong to the mail service. */
+    if (folder.selectable && folder.role === "other") items.push({ label: "Delete folder…", icon: <FolderMinus size={15} />, run: () => setFolderToDelete(folder) });
+    return items;
+  };
 
   return (
     <div className="app">
@@ -463,6 +691,10 @@ export default function App() {
           selectedFolderId={selectedFolderId}
           busyAccountIds={busyAccountIds}
           accountErrors={accountErrors}
+          accountLabels={accountLabels}
+          onAccountMenu={(account, position) => setAccountMenu({ account, position })}
+          hiddenFolders={hiddenFolders}
+          showHidden={showHidden}
           onSelectFolder={(folder) => void openFolder(folder)}
           onFolderMenu={(folder, position) => setFolderMenu({ folder, position })}
           onAddAccount={() => setAddAccountOpen(true)}
@@ -476,6 +708,7 @@ export default function App() {
           busy={messagesBusy}
           error={messagesError}
           selectedUid={selectedUid}
+          selectedUids={extraUids}
           menuUid={messageMenu?.message.uid ?? null}
           collapsePreviousDays={settings.collapsePreviousDays}
           hasOlder={hasOlder}
@@ -483,7 +716,20 @@ export default function App() {
           searchBusy={searchBusy}
           onLoadOlder={() => void loadOlder()}
           onSearch={(searchText) => void searchServer(searchText)}
-          onSelect={(message) => setSelectedUid(message.uid)}
+          onSelect={(message, mode) => {
+            if (mode === "single" || selectedUid === null) {
+              setExtraUids(new Set());
+              setSelectedUid(message.uid);
+            } else if (message.uid !== selectedUid) {
+              setExtraUids((current) => {
+                const next = new Set(current);
+                if (!next.delete(message.uid)) next.add(message.uid);
+                return next;
+              });
+            }
+          }}
+          onSelectRange={(range) => setExtraUids(new Set(range.map((message) => message.uid).filter((uid) => uid !== selectedUid)))}
+          onUnstar={(message) => selectedFolder && void setStar(selectedFolder, message, false)}
           onMenu={(message, position) => setMessageMenu({ message, position })}
           onRefresh={() => selectedFolder && void openFolder(selectedFolder)}
         />
@@ -494,6 +740,7 @@ export default function App() {
             inTrash={selectedFolder.role === "trash"}
             onOpened={() => void markSeen(selectedFolder, selectedMessage, true)}
             onMarkUnread={() => void markSeen(selectedFolder, selectedMessage, false)}
+            onStar={(flagged) => void setStar(selectedFolder, selectedMessage, flagged)}
             onReply={(mode) => void startReply(selectedMessage, mode)}
             onDelete={() => requestDelete(selectedMessage)}
           />
@@ -529,6 +776,17 @@ export default function App() {
       {messageMenu && (
         <ContextMenu position={messageMenu.position} items={messageMenuItems(messageMenu.message)} onClose={() => setMessageMenu(null)} />
       )}
+      {accountMenu && (
+        <ContextMenu position={accountMenu.position} items={accountMenuItems(accountMenu.account)} onClose={() => setAccountMenu(null)} />
+      )}
+      {accountToLabel && (
+        <LabelDialog
+          email={accountToLabel.email}
+          label={accountLabels[accountToLabel.id] ?? ""}
+          onSave={(label) => { const account = accountToLabel; setAccountToLabel(null); setAccountLabel(account, label); }}
+          onCancel={() => setAccountToLabel(null)}
+        />
+      )}
       {folderMenu && (
         <ContextMenu position={folderMenu.position} items={folderMenuItems(folderMenu.folder)} onClose={() => setFolderMenu(null)} />
       )}
@@ -544,11 +802,53 @@ export default function App() {
             : `This moves ${emailCount(folderToEmpty.total)} to the trash. This includes the emails that the list does not show.`}
         </ConfirmDialog>
       )}
+      {entryToBlock && selectedFolder && (
+        <BlockDialog
+          entry={entryToBlock}
+          emailCount={messagesFromBlocked(messages, entryToBlock).length}
+          inTrash={selectedFolder.role === "trash"}
+          onConfirm={(deleteEmails) => { const entry = entryToBlock; setEntryToBlock(null); void block(selectedFolder, entry, deleteEmails); }}
+          onCancel={() => setEntryToBlock(null)}
+        />
+      )}
+      {folderToDelete && (
+        <ConfirmDialog
+          title={`Delete the folder ${folderToDelete.name}?`}
+          confirmLabel="Delete folder"
+          onConfirm={() => { const folder = folderToDelete; setFolderToDelete(null); void removeFolder(folder); }}
+          onCancel={() => setFolderToDelete(null)}
+        >
+          {accounts.find((account) => account.id === folderToDelete.account_id)?.kind === "gmail"
+            ? "This deletes the folder from Gmail. Gmail keeps its emails in All Mail."
+            : `This deletes the folder and its ${emailCount(folderToDelete.total)} from the server for good. They cannot come back.`}
+          {" "}To only take the folder out of the list, cancel and use "Hide folder".
+        </ConfirmDialog>
+      )}
+      {messagesToDelete && selectedFolder && (
+        <ConfirmDialog
+          title={selectedFolder.role === "trash" ? `Delete ${emailCount(messagesToDelete.length)} for good?` : `Delete ${emailCount(messagesToDelete.length)}?`}
+          confirmLabel="Delete"
+          onConfirm={() => { const [first, ...others] = messagesToDelete; setMessagesToDelete(null); if (first) void deleteMessage(selectedFolder, first, others); }}
+          onCancel={() => setMessagesToDelete(null)}
+        >
+          {selectedFolder.role === "trash"
+            ? "This deletes the selected emails from the server, and they cannot come back."
+            : "The selected emails move to the trash."}
+        </ConfirmDialog>
+      )}
+      {messagesToMove && selectedFolder && (
+        <MoveDialog
+          count={messagesToMove.length}
+          folders={(accounts.find((account) => account.id === selectedFolder.account_id)?.folders ?? []).filter((folder) => folder.selectable && folder.id !== selectedFolder.id)}
+          onMove={(target) => { const moved = messagesToMove; setMessagesToMove(null); void moveMessages(selectedFolder, moved, target); }}
+          onCancel={() => setMessagesToMove(null)}
+        />
+      )}
       {aboutOpen && (
         <AboutDialog version={version} initialUpdateInfo={startupUpdate} onClose={() => setAboutOpen(false)} />
       )}
       {settingsOpen && (
-        <SettingsDialog settings={settings} onChange={changeSettings} onClose={() => setSettingsOpen(false)} />
+        <SettingsDialog initialCategory={settingsCategory} settings={settings} onChange={changeSettings} onClose={() => setSettingsOpen(false)} />
       )}
       {addAccountOpen && (
         <AddAccountDialog onClose={() => setAddAccountOpen(false)} onAdded={(accountId) => void accountAdded(accountId)} />

@@ -17,7 +17,8 @@ use tauri_plugin_opener::OpenerExt;
 use crate::compose::{self, Draft, Outgoing, ReplyMode};
 use crate::links::{self, LinkCheck};
 use crate::preview::{self, MessageView};
-use crate::{google, imap, remote, secrets};
+use crate::oauth::SignIn;
+use crate::{blocklist, google, imap, microsoft, remote, secrets};
 
 /** How many of a folder's newest messages the list shows. */
 const MESSAGE_LIST_SIZE: u32 = 200;
@@ -65,6 +66,20 @@ macro_rules! with_session {
         result
     }};
 }
+/** The kinds of account, as the store has them. */
+const KIND_GMAIL: &str = "gmail";
+const KIND_MICROSOFT: &str = "microsoft";
+const KIND_MICROSOFT_WORK: &str = "microsoft365";
+
+/** The kind of Microsoft account, for an account of one of the two Microsoft kinds. */
+fn microsoft_audience(kind: &str) -> Option<microsoft::Audience> {
+    match kind {
+        KIND_MICROSOFT => Some(microsoft::Audience::Personal),
+        KIND_MICROSOFT_WORK => Some(microsoft::Audience::Work),
+        _ => None,
+    }
+}
+
 /** The mark that Windows puts on a file from the internet: zone 3. Programs then open the file with care. */
 const INTERNET_ZONE_MARK: &str = "[ZoneTransfer]\r\nZoneId=3\r\n";
 
@@ -123,9 +138,21 @@ impl AppState {
                 return Ok(token.value.clone());
             }
         }
-        let refresh_token = secrets::read(&secrets::account_target(account.id))?
+        let target = secrets::account_target(account.id);
+        let refresh_token = secrets::read(&target)?
             .with_context(|| format!("Mail Sage has no sign-in for {}. Remove the account and add it again.", account.email))?;
-        let (value, expires_in) = google::refresh(&refresh_token).await?;
+        let (value, expires_in) = match (account.kind.as_str(), microsoft_audience(&account.kind)) {
+            (KIND_GMAIL, _) => google::refresh(&refresh_token).await?,
+            (_, Some(audience)) => {
+                let refreshed = microsoft::refresh(&refresh_token, audience).await?;
+                /* Microsoft gives a new refresh token each time. The old one stays good for some time, so a failed save is not the end of the sign-in. */
+                if let Some(newer) = refreshed.refresh_token.filter(|newer| *newer != refresh_token) {
+                    let _ = secrets::save(&target, &newer);
+                }
+                (refreshed.access_token, refreshed.expires_in)
+            }
+            (other, None) => bail!("Mail Sage has no sign-in for a \"{other}\" account"),
+        };
         self.keep_access_token(account.id, value.clone(), expires_in);
         Ok(value)
     }
@@ -235,7 +262,7 @@ impl AppState {
 
     async fn open_session(&self, account: &Account) -> Result<imap::Session> {
         match account.kind.as_str() {
-            "gmail" => {
+            KIND_GMAIL | KIND_MICROSOFT | KIND_MICROSOFT_WORK => {
                 let token = self.access_token(account).await?;
                 imap::open_with_token(&account.imap_host, account.imap_port, &account.email, &token).await
             }
@@ -283,39 +310,75 @@ pub fn google_sign_in_ready() -> bool {
     google::available()
 }
 
+fn audience_of(work: bool) -> microsoft::Audience {
+    if work { microsoft::Audience::Work } else { microsoft::Audience::Personal }
+}
+
+/** True when this build can sign in to Microsoft: with `work`, to a work or school account; without it, to a personal account. */
+#[tauri::command]
+pub fn microsoft_sign_in_ready(work: bool) -> bool {
+    audience_of(work).available()
+}
+
 /** All accounts with their stored folders. */
 #[tauri::command]
 pub fn list_accounts(state: State<'_, AppState>) -> Result<Vec<AccountView>, String> {
     account_views(&state.store).map_err(text)
 }
 
-async fn add_gmail(app: &AppHandle, state: &AppState) -> Result<Account> {
+/** Marks that a sign-in is open in the browser. Only one can be open at a time. */
+fn start_sign_in(state: &AppState) -> Result<SignInGuard<'_>> {
     if state.sign_in_running.swap(true, Ordering::SeqCst) {
         bail!("A sign-in is already open in your browser.");
     }
-    let _guard = SignInGuard(&state.sign_in_running);
+    Ok(SignInGuard(&state.sign_in_running))
+}
+
+/** Adds the account of a complete sign-in: the account goes to the store, the refresh token to Windows Credential Manager. */
+fn add_signed_in(state: &AppState, kind: &str, sign_in: &SignIn, imap_host: &str, imap_port: u16) -> Result<Account> {
+    let account = state.store.add_account(kind, &sign_in.email, imap_host, imap_port)?;
+    if let Err(error) = secrets::save(&secrets::account_target(account.id), &sign_in.refresh_token) {
+        let _ = state.store.delete_account(account.id);
+        return Err(error);
+    }
+    state.keep_access_token(account.id, sign_in.access_token.clone(), sign_in.expires_in);
+    Ok(account)
+}
+
+async fn add_gmail(app: &AppHandle, state: &AppState) -> Result<Account> {
+    let _guard = start_sign_in(state)?;
     let sign_in = google::sign_in(app, &state.sign_in_cancel).await?;
-    let account = match state.store.add_account("gmail", &sign_in.email, google::IMAP_HOST, google::IMAP_PORT) {
-        Ok(account) => account,
+    match add_signed_in(state, KIND_GMAIL, &sign_in, google::IMAP_HOST, google::IMAP_PORT) {
+        Ok(account) => Ok(account),
         Err(error) => {
             /* The account is not added, so the permission that Google just gave is cancelled again. */
             let _ = google::revoke(&sign_in.refresh_token).await;
-            return Err(error);
+            Err(error)
         }
-    };
-    if let Err(error) = secrets::save(&secrets::account_target(account.id), &sign_in.refresh_token) {
-        let _ = state.store.delete_account(account.id);
-        let _ = google::revoke(&sign_in.refresh_token).await;
-        return Err(error);
     }
-    state.keep_access_token(account.id, sign_in.access_token, sign_in.expires_in);
-    Ok(account)
 }
 
 /** Signs in to Google in the browser and adds the Gmail account. */
 #[tauri::command]
 pub async fn add_gmail_account(app: AppHandle, state: State<'_, AppState>) -> Result<Account, String> {
     add_gmail(&app, &state).await.map_err(text)
+}
+
+/**
+ * Microsoft has no command that cancels a permission. When the account is
+ * not added, Mail Sage drops the tokens; they are in memory only at that time.
+ */
+async fn add_microsoft(app: &AppHandle, state: &AppState, work: bool) -> Result<Account> {
+    let _guard = start_sign_in(state)?;
+    let sign_in = microsoft::sign_in(app, &state.sign_in_cancel, audience_of(work)).await?;
+    let kind = if work { KIND_MICROSOFT_WORK } else { KIND_MICROSOFT };
+    add_signed_in(state, kind, &sign_in, microsoft::IMAP_HOST, microsoft::IMAP_PORT)
+}
+
+/** Signs in to Microsoft in the browser and adds the account: with `work`, a Microsoft 365 account; without it, an Outlook.com or Hotmail account. */
+#[tauri::command]
+pub async fn add_microsoft_account(app: AppHandle, state: State<'_, AppState>, work: bool) -> Result<Account, String> {
+    add_microsoft(&app, &state, work).await.map_err(text)
 }
 
 /** Stops a sign-in that waits for the browser. */
@@ -326,12 +389,15 @@ pub fn cancel_sign_in(state: State<'_, AppState>) {
 
 /**
  * Removes an account: its stored mail, its sign-in in Windows Credential
- * Manager, and (best effort) the permission at Google.
+ * Manager, and (best effort) the permission at Google. Microsoft has no
+ * command that cancels a permission; the user can do that on Microsoft's
+ * account page (docs/MICROSOFT-SETUP.md).
  */
 #[tauri::command]
 pub async fn remove_account(state: State<'_, AppState>, account_id: i64) -> Result<(), String> {
     let target = secrets::account_target(account_id);
-    if let Ok(Some(refresh_token)) = secrets::read(&target) {
+    let is_gmail = state.store.account(account_id).is_ok_and(|account| account.kind == KIND_GMAIL);
+    if let (true, Ok(Some(refresh_token))) = (is_gmail, secrets::read(&target)) {
         let _ = google::revoke(&refresh_token).await;
     }
     secrets::delete(&target).map_err(text)?;
@@ -354,6 +420,31 @@ pub async fn sync_folders(state: State<'_, AppState>, account_id: i64) -> Result
     sync_account_folders(&state, account_id).await.map_err(text)
 }
 
+async fn remove_folder(state: &AppState, folder_id: i64) -> Result<Vec<Folder>> {
+    let folder = state.store.folder(folder_id)?;
+    /* The well-known folders (Inbox, Sent, Trash, and so on) belong to the mail service. Only a folder that the user made can go. */
+    if folder.role != "other" || !folder.selectable {
+        bail!("Mail Sage does not delete the folder \"{}\": the mail service needs it.", folder.name);
+    }
+    let account = state.store.account(folder.account_id)?;
+    /* A connection that waits can have this folder open, and some servers refuse to delete an open folder. So the delete uses a new connection. */
+    state.idle_sessions().remove(&account.id);
+    let mut session = state.open_session(&account).await?;
+    imap::delete_folder(&mut session, &folder.path).await?;
+    state.keep_session(account.id, session, true);
+    state.opened().retain(|message| message.folder_id != folder_id);
+    sync_account_folders(state, account.id).await
+}
+
+/**
+ * Deletes a folder that the user made, on the server. Returns the account's
+ * folders as the server has them after that. The window asks the user first.
+ */
+#[tauri::command]
+pub async fn delete_folder(state: State<'_, AppState>, folder_id: i64) -> Result<Vec<Folder>, String> {
+    remove_folder(&state, folder_id).await.map_err(text)
+}
+
 /** The stored message list of a folder, newest first. */
 #[tauri::command]
 pub fn list_messages(state: State<'_, AppState>, folder_id: i64) -> Result<Vec<MessageHeader>, String> {
@@ -369,7 +460,47 @@ async fn sync_folder_messages(state: &AppState, folder_id: i64) -> Result<Vec<Me
     let fetched: Result<imap::FolderFetch> = with_session!(state, &account, |session| imap::fetch_newest(session, &folder.path, MESSAGE_LIST_SIZE));
     let fetched = fetched?;
     state.store.save_messages(folder_id, fetched.uid_validity, fetched.lowest_uid, &fetched.headers)?;
+    apply_blocks(state, &folder, &account, fetched.headers).await;
     state.store.messages(folder_id, MESSAGE_LIST_SIZE)
+}
+
+/**
+ * Moves the messages from blocked senders out of an inbox, to the account's
+ * Junk folder on the server. Returns the messages that stay. The messages
+ * must be in the store already.
+ *
+ * Only an inbox is cleaned: in each other folder the user put the message
+ * there, or looks for it there. When the move is not possible (no Junk
+ * folder, or the server refuses), the messages stay in the list; the next
+ * read of the folder tries again.
+ */
+async fn apply_blocks(state: &AppState, folder: &Folder, account: &Account, headers: Vec<MessageHeader>) -> Vec<MessageHeader> {
+    if folder.role != "inbox" || headers.is_empty() {
+        return headers;
+    }
+    let entries = match state.store.blocked() {
+        Ok(entries) if !entries.is_empty() => entries,
+        _ => return headers,
+    };
+    let uids: Vec<u32> = headers.iter().filter(|header| blocklist::is_blocked(&header.from_address, &entries)).map(|header| header.uid).collect();
+    if uids.is_empty() {
+        return headers;
+    }
+    let (Ok(Some(junk)), Ok(uid_validity)) = (state.store.folder_with_role(account.id, "junk"), state.store.folder_uid_validity(folder.id)) else {
+        return headers;
+    };
+    if move_to_folder(state, account, folder, uid_validity, &uids, &junk).await.is_err() {
+        return headers;
+    }
+    state.opened().retain(|message| !(message.folder_id == folder.id && uids.contains(&message.uid)));
+    headers.into_iter().filter(|header| !uids.contains(&header.uid)).collect()
+}
+
+/** Moves messages to a different folder of the account, on the server and in the store. */
+async fn move_to_folder(state: &AppState, account: &Account, folder: &Folder, uid_validity: Option<u32>, uids: &[u32], target: &Folder) -> Result<()> {
+    let moved: Result<()> = with_session!(state, account, |session| imap::move_messages(session, &folder.path, uid_validity, uids, &target.path));
+    moved?;
+    state.store.remove_messages(folder.id, uids, Some(target.id))
 }
 
 /** Reads the folder's newest messages from the server, stores them, and returns the list. */
@@ -391,7 +522,8 @@ async fn older_messages(state: &AppState, folder_id: i64, before_uid: u32) -> Re
     let account = state.store.account(folder.account_id)?;
     let fetched: Result<Vec<MessageHeader>> =
         with_session!(state, &account, |session| imap::fetch_older(session, &folder.path, uid_validity, before_uid, MESSAGE_LIST_SIZE as usize));
-    keep_headers(state, folder_id, fetched?)
+    let headers = keep_headers(state, folder_id, fetched?)?;
+    Ok(apply_blocks(state, &folder, &account, headers).await)
 }
 
 /** Reads the next older messages of a folder from the server: those before the message `before_uid`. Returns only the new ones. */
@@ -409,7 +541,8 @@ async fn found_messages(state: &AppState, folder_id: i64, search: &str) -> Resul
     let account = state.store.account(folder.account_id)?;
     let fetched: Result<Vec<MessageHeader>> =
         with_session!(state, &account, |session| imap::search_headers(session, &folder.path, uid_validity, &query, MESSAGE_LIST_SIZE as usize));
-    keep_headers(state, folder_id, fetched?)
+    let headers = keep_headers(state, folder_id, fetched?)?;
+    Ok(apply_blocks(state, &folder, &account, headers).await)
 }
 
 /**
@@ -489,6 +622,70 @@ pub fn set_sender_trusted(state: State<'_, AppState>, address: String, trusted: 
     state.store.set_sender_trusted(&address, trusted).map_err(text)
 }
 
+/** The block list: addresses, and domains with the at sign in front. */
+#[tauri::command]
+pub fn list_blocked(state: State<'_, AppState>) -> Result<Vec<String>, String> {
+    state.store.blocked().map_err(text)
+}
+
+/** What a new block did in the folder that the user looks at. */
+#[derive(Serialize)]
+pub struct BlockOutcome {
+    /** The account's folders with the new counts. */
+    folders: Vec<Folder>,
+    /** The messages that moved to the Junk folder. */
+    removed: Vec<u32>,
+}
+
+/** Puts an entry in the block list, and returns it in its clean form. */
+fn add_block_entry(state: &AppState, entry: &str) -> Result<String> {
+    let entry = blocklist::normalize(entry)?;
+    /* A block of an own address, or of the domain of one, is probably a mistake: it hides the user's own mail. */
+    let own = state.store.accounts()?.into_iter().map(|account| account.email).collect::<Vec<_>>();
+    if own.iter().any(|email| blocklist::is_blocked(email, std::slice::from_ref(&entry))) {
+        bail!("{entry} is the address or the domain of one of your accounts. Mail Sage does not block it.");
+    }
+    state.store.set_blocked(&entry, true)?;
+    Ok(entry)
+}
+
+/**
+ * Adds an entry to the block list from the settings, where the user types
+ * it. Returns the entry in its clean form. Mail from the sender moves to
+ * the Junk folder the next time Mail Sage reads an inbox.
+ */
+#[tauri::command]
+pub fn add_blocked(state: State<'_, AppState>, entry: String) -> Result<String, String> {
+    add_block_entry(&state, &entry).map_err(text)
+}
+
+async fn block(state: &AppState, entry: &str, folder_id: i64) -> Result<BlockOutcome> {
+    add_block_entry(state, entry)?;
+    let folder = state.store.folder(folder_id)?;
+    let account = state.store.account(folder.account_id)?;
+    let stored = state.store.messages(folder_id, u32::MAX)?;
+    let before: Vec<u32> = stored.iter().map(|header| header.uid).collect();
+    let kept: HashSet<u32> = apply_blocks(state, &folder, &account, stored).await.into_iter().map(|header| header.uid).collect();
+    Ok(BlockOutcome { folders: state.store.folders(account.id)?, removed: before.into_iter().filter(|uid| !kept.contains(uid)).collect() })
+}
+
+/**
+ * Adds a sender address or a sender domain to the block list. When the
+ * folder is an inbox, its messages from that sender move to the account's
+ * Junk folder at once. New mail from the sender moves each time Mail Sage
+ * reads an inbox.
+ */
+#[tauri::command]
+pub async fn block_sender(state: State<'_, AppState>, entry: String, folder_id: i64) -> Result<BlockOutcome, String> {
+    block(&state, &entry, folder_id).await.map_err(text)
+}
+
+/** Removes an entry from the block list. Messages that are in the Junk folder stay there. */
+#[tauri::command]
+pub fn unblock_sender(state: State<'_, AppState>, entry: String) -> Result<(), String> {
+    blocklist::normalize(&entry).and_then(|entry| state.store.set_blocked(&entry, false)).map_err(text)
+}
+
 /** Checks a link from a message. `text` is what the message shows for the link. Nothing opens. */
 #[tauri::command]
 pub fn check_link(href: String, text: String) -> Result<LinkCheck, String> {
@@ -518,6 +715,29 @@ async fn change_seen(state: &AppState, folder_id: i64, uids: &[u32], seen: bool)
 #[tauri::command]
 pub async fn set_messages_seen(state: State<'_, AppState>, folder_id: i64, uids: Vec<u32>, seen: bool) -> Result<Vec<Folder>, String> {
     change_seen(&state, folder_id, &uids, seen).await.map_err(text)
+}
+
+async fn change_flagged(state: &AppState, folder_id: i64, uids: &[u32], flagged: bool) -> Result<Vec<Folder>> {
+    let folder = state.store.folder(folder_id)?;
+    if !uids.is_empty() {
+        let uid_validity = state.store.folder_uid_validity(folder_id)?;
+        let account = state.store.account(folder.account_id)?;
+        let result: Result<()> = with_session!(state, &account, |session| imap::set_flagged(session, &folder.path, uid_validity, uids, flagged));
+        result?;
+        if folder.role == "flagged" && !flagged {
+            /* The folder of starred messages (Gmail's "Starred") shows only messages with a star, so a message without it is no longer there. */
+            state.store.remove_messages(folder_id, uids, None)?;
+        } else {
+            state.store.mark_flagged(folder_id, uids, flagged)?;
+        }
+    }
+    state.store.folders(folder.account_id)
+}
+
+/** Puts the star on messages, or removes it, on the server and in the store. Returns the account's folders with the new counts. */
+#[tauri::command]
+pub async fn set_messages_flagged(state: State<'_, AppState>, folder_id: i64, uids: Vec<u32>, flagged: bool) -> Result<Vec<Folder>, String> {
+    change_flagged(&state, folder_id, &uids, flagged).await.map_err(text)
 }
 
 async fn remove_messages(state: &AppState, folder_id: i64, uids: &[u32]) -> Result<Vec<Folder>> {
@@ -552,11 +772,61 @@ pub async fn delete_messages(state: State<'_, AppState>, folder_id: i64, uids: V
     remove_messages(&state, folder_id, &uids).await.map_err(text)
 }
 
+async fn not_junk(state: &AppState, folder_id: i64, uids: &[u32]) -> Result<Vec<Folder>> {
+    let folder = state.store.folder(folder_id)?;
+    if folder.role != "junk" {
+        bail!("Only a message in the Junk folder can be marked as not junk.");
+    }
+    if !uids.is_empty() {
+        let account = state.store.account(folder.account_id)?;
+        /* Mail from a blocked sender moves out of the inbox again at the next read, so the block must go first. */
+        let entries = state.store.blocked()?;
+        let stored = state.store.messages(folder_id, u32::MAX)?;
+        if let Some(blocked) = stored.iter().find(|header| uids.contains(&header.uid) && blocklist::is_blocked(&header.from_address, &entries)) {
+            bail!("{} is blocked. Remove the block in File > Settings > Blocked senders first.", blocked.from_address);
+        }
+        let inbox = state.store.folder_with_role(account.id, "inbox")?.context("This account has no inbox. Refresh the folders, then try again.")?;
+        let uid_validity = state.store.folder_uid_validity(folder_id)?;
+        move_to_folder(state, &account, &folder, uid_validity, uids, &inbox).await?;
+        state.opened().retain(|message| !(message.folder_id == folder_id && uids.contains(&message.uid)));
+    }
+    state.store.folders(folder.account_id)
+}
+
+/** Moves messages from the Junk folder to the inbox of the account. Returns the account's folders with the new counts. */
+#[tauri::command]
+pub async fn move_to_inbox(state: State<'_, AppState>, folder_id: i64, uids: Vec<u32>) -> Result<Vec<Folder>, String> {
+    not_junk(&state, folder_id, &uids).await.map_err(text)
+}
+
+async fn move_to(state: &AppState, folder_id: i64, uids: &[u32], target_id: i64) -> Result<Vec<Folder>> {
+    let folder = state.store.folder(folder_id)?;
+    let target = state.store.folder(target_id)?;
+    if target.account_id != folder.account_id {
+        bail!("Mail Sage moves a message only to a folder of the same account.");
+    }
+    if target.id == folder.id || !target.selectable {
+        bail!("The folder \"{}\" cannot get these messages.", target.name);
+    }
+    if !uids.is_empty() {
+        let account = state.store.account(folder.account_id)?;
+        let uid_validity = state.store.folder_uid_validity(folder_id)?;
+        move_to_folder(state, &account, &folder, uid_validity, uids, &target).await?;
+        state.opened().retain(|message| !(message.folder_id == folder_id && uids.contains(&message.uid)));
+    }
+    state.store.folders(folder.account_id)
+}
+
+/** Moves messages to a different folder of the same account, on the server and in the store. Returns the account's folders with the new counts. */
+#[tauri::command]
+pub async fn move_messages_to(state: State<'_, AppState>, folder_id: i64, uids: Vec<u32>, target_id: i64) -> Result<Vec<Folder>, String> {
+    move_to(&state, folder_id, &uids, target_id).await.map_err(text)
+}
+
 async fn mark_all_seen(state: &AppState, folder_id: i64) -> Result<Vec<Folder>> {
     let folder = state.store.folder(folder_id)?;
-    let uid_validity = state.store.folder_uid_validity(folder_id)?;
     let account = state.store.account(folder.account_id)?;
-    let result: Result<()> = with_session!(state, &account, |session| imap::set_all_seen(session, &folder.path, uid_validity));
+    let result: Result<()> = with_session!(state, &account, |session| imap::set_all_seen(session, &folder.path));
     result?;
     state.store.mark_all_seen(folder_id)?;
     state.store.folders(folder.account_id)
@@ -570,7 +840,6 @@ pub async fn mark_folder_seen(state: State<'_, AppState>, folder_id: i64) -> Res
 
 async fn remove_all_messages(state: &AppState, folder_id: i64) -> Result<Vec<Folder>> {
     let folder = state.store.folder(folder_id)?;
-    let uid_validity = state.store.folder_uid_validity(folder_id)?;
     let account = state.store.account(folder.account_id)?;
     /* The same rule as for one message: the trash is emptied for good; any other folder moves to the trash. */
     let trash = if folder.role == "trash" {
@@ -579,7 +848,7 @@ async fn remove_all_messages(state: &AppState, folder_id: i64) -> Result<Vec<Fol
         Some(state.store.folder_with_role(account.id, "trash")?.context("This account has no trash folder. Refresh the folders, then try again.")?)
     };
     let target = trash.as_ref().map(|trash| trash.path.as_str());
-    let result: Result<()> = with_session!(state, &account, |session| imap::remove_all(session, &folder.path, uid_validity, target));
+    let result: Result<()> = with_session!(state, &account, |session| imap::remove_all(session, &folder.path, target));
     result?;
     state.store.remove_all_messages(folder_id, trash.map(|trash| trash.id))?;
     state.opened().retain(|message| message.folder_id != folder_id);
@@ -654,18 +923,22 @@ async fn send(state: &AppState, outgoing: Outgoing) -> Result<()> {
         files.push((path.file_name().map(|name| name.to_string_lossy().into_owned()).unwrap_or_default(), bytes));
     }
     let message = compose::build(&account.email, &outgoing, files)?;
-    match account.kind.as_str() {
-        "gmail" => {
+    match (account.kind.as_str(), microsoft_audience(&account.kind)) {
+        (KIND_GMAIL, _) => {
             let token = state.access_token(&account).await?;
-            compose::send_with_token(google::SMTP_HOST, &account.email, &token, message).await?;
+            compose::send_with_token(google::SMTP_HOST, compose::Encryption::FromStart, &account.email, &token, message).await?;
         }
-        other => bail!("Mail Sage cannot send from a \"{other}\" account yet"),
+        (_, Some(audience)) => {
+            let token = state.access_token(&account).await?;
+            compose::send_with_token(audience.smtp_host(), compose::Encryption::StartTls, &account.email, &token, message).await?;
+        }
+        (other, None) => bail!("Mail Sage cannot send from a \"{other}\" account yet"),
     }
     state.picked_files().clear();
     Ok(())
 }
 
-/** Sends a message from the compose window. Gmail keeps its own copy in the Sent folder. */
+/** Sends a message from the compose window. Gmail and Microsoft keep their own copy in the Sent folder. */
 #[tauri::command]
 pub async fn send_message(state: State<'_, AppState>, outgoing: Outgoing) -> Result<(), String> {
     send(&state, outgoing).await.map_err(text)

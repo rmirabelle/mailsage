@@ -26,19 +26,27 @@ order of work.
 - `src-tauri/src/accounts.rs` holds the commands that the window calls.
   `store.rs` is the SQLite store (accounts, folders, message headers).
   `secrets.rs` is Windows Credential Manager. `google.rs` is the Google
-  sign-in. `imap.rs` reads folders and headers from the server.
+  sign-in (Gmail) and `microsoft.rs` is the Microsoft sign-in (Outlook.com,
+  Hotmail); `oauth.rs` has the browser part that the two have in common.
+  `imap.rs` reads folders and headers from the server.
 - `src-tauri/src/preview.rs` is the secure preview: it cleans message HTML and
   builds the page for the preview frame. Its tests are the set of hostile
   emails; add a test there for each new attack. `links.rs` checks a link
   before it opens. `remote.rs` fetches remote images (only when the user
   asks, never from the local network). `src/components/MessagePreview.tsx`
   shows the page in a frame that cannot run scripts.
-- `src-tauri/src/compose.rs` builds and sends a message (plain text, SMTP
-  on port 465) and makes the starting text of a reply or a forward. A sent
+- `src-tauri/src/compose.rs` builds and sends a message (plain text; SMTP
+  on port 465 for Gmail, port 587 with STARTTLS for Microsoft, never without
+  encryption) and makes the starting text of a reply or a forward. A sent
   message must not name the mail program or the computer. Only files that
   the user picked in the "Attach" dialog can go out (`AppState::picked_files`).
 - Delete moves a message to the account's trash folder. Only a message that
   is in the trash already is deleted for good, and the window asks first.
+- `src-tauri/src/blocklist.rs` is the block list (sender addresses, and
+  domains with the at sign in front). `apply_blocks` in `accounts.rs` moves
+  mail from a blocked sender out of an inbox to the Junk folder each time
+  Mail Sage reads the inbox. The match uses the real `From` address only.
+  The list shows in File > Settings > Blocked senders.
 - Message bodies are not written to the disk. The last few opened messages
   stay in memory (`AppState::opened` in `accounts.rs`).
 - `src/components/MessageList.tsx` shows day groups, and only the latest
@@ -54,7 +62,8 @@ order of work.
   all" always asks first with the number of emails.
 - `src-tauri/build.rs` reads the sign-in client values from the environment
   or from the gitignored `secrets/oauth.env`; the code embeds them with
-  `obfstr`. `docs/GOOGLE-SETUP.md` has the registration steps.
+  `obfstr`. `docs/GOOGLE-SETUP.md` and `docs/MICROSOFT-SETUP.md` have the
+  registration steps.
 - `src-tauri/src/updater.rs` checks `rmirabelle/mailsage` GitHub releases.
 
 ## Release memory

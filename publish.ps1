@@ -87,13 +87,13 @@ function Get-PeSubsystem {
 function Get-SignInSecrets {
   <#
   .SYNOPSIS
-    Read the sign-in client values that the build embeds (see docs/GOOGLE-SETUP.md).
+    Read the sign-in client values that the build embeds (see docs/GOOGLE-SETUP.md and docs/MICROSOFT-SETUP.md).
 
   .DESCRIPTION
     An environment variable wins over the same name in secrets/oauth.env,
     the same rule as src-tauri/build.rs.
   #>
-  $names = @("GOOGLE_CLIENT_ID", "GOOGLE_CLIENT_SECRET")
+  $names = @("GOOGLE_CLIENT_ID", "GOOGLE_CLIENT_SECRET", "MICROSOFT_CLIENT_ID")
   $fromFile = @{}
   if (Test-Path -LiteralPath "secrets/oauth.env" -PathType Leaf) {
     foreach ($line in Get-Content -LiteralPath "secrets/oauth.env") {
@@ -105,9 +105,15 @@ function Get-SignInSecrets {
     $value = [Environment]::GetEnvironmentVariable($name)
     if ([string]::IsNullOrWhiteSpace($value)) { $value = $fromFile[$name] }
     if ([string]::IsNullOrWhiteSpace($value)) {
-      throw "$name is missing. Put it in secrets/oauth.env (see docs/GOOGLE-SETUP.md). A release without it cannot sign in to Gmail."
+      throw "$name is missing. Put it in secrets/oauth.env (see docs/GOOGLE-SETUP.md and docs/MICROSOFT-SETUP.md). A release without it cannot sign in to that mail service."
     }
     $values[$name] = $value.Trim()
+  }
+  # A value that a release can be without: the build then has no sign-in for that kind of account.
+  foreach ($name in @("MICROSOFT_WORK_CLIENT_ID")) {
+    $value = [Environment]::GetEnvironmentVariable($name)
+    if ([string]::IsNullOrWhiteSpace($value)) { $value = $fromFile[$name] }
+    if (-not [string]::IsNullOrWhiteSpace($value)) { $values[$name] = $value.Trim() }
   }
   return $values
 }

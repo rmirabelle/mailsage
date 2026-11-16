@@ -76,7 +76,7 @@ async fn connect(host: &str, port: u16) -> Result<async_imap::Client<TlsStream<T
         .map_err(|_| anyhow!("{host} did not answer in time"))?
 }
 
-/** Opens a session with an OAuth access token (Gmail, and later Microsoft). */
+/** Opens a session with an OAuth access token (Gmail and Microsoft). */
 pub async fn open_with_token(host: &str, port: u16, email: &str, access_token: &str) -> Result<Session> {
     let client = connect(host, port).await?;
     let refusal = Arc::new(Mutex::new(None));
@@ -108,7 +108,23 @@ fn folder_role(path: &str, attributes: &[NameAttribute<'_>]) -> &'static str {
         };
         return role;
     }
-    "other"
+    role_from_name(path)
+}
+
+/**
+ * The use of a folder from its name, for a server that gives no marks.
+ * These are the fixed English folder names of Outlook.com. Only a folder at
+ * the top level counts.
+ */
+fn role_from_name(path: &str) -> &'static str {
+    match path.to_ascii_lowercase().as_str() {
+        "deleted" | "deleted items" | "trash" => "trash",
+        "junk" | "junk email" | "junk e-mail" | "spam" => "junk",
+        "sent" | "sent items" => "sent",
+        "drafts" => "drafts",
+        "archive" => "archive",
+        _ => "other",
+    }
 }
 
 /** The readable last part of a folder path, and how deep the folder is. */
@@ -146,6 +162,11 @@ pub async fn list_folders(session: &mut Session) -> Result<Vec<FolderInfo>> {
         }
     }
     Ok(folders)
+}
+
+/** Deletes a folder on the server. On most servers, the messages in it go with it. */
+pub async fn delete_folder(session: &mut Session, path: &str) -> Result<()> {
+    session.delete(path).await.context("the server did not delete the folder")
 }
 
 /** The newest messages of a folder, as fetched. */
@@ -360,6 +381,12 @@ pub async fn set_seen(session: &mut Session, path: &str, uid_validity: Option<u3
     store_flags(session, uids, if seen { "+FLAGS.SILENT (\\Seen)" } else { "-FLAGS.SILENT (\\Seen)" }).await
 }
 
+/** Puts the star (the "flagged" mark) on messages on the server, or removes it. */
+pub async fn set_flagged(session: &mut Session, path: &str, uid_validity: Option<u32>, uids: &[u32], flagged: bool) -> Result<()> {
+    select_checked(session, path, uid_validity).await?;
+    store_flags(session, uids, if flagged { "+FLAGS.SILENT (\\Flagged)" } else { "-FLAGS.SILENT (\\Flagged)" }).await
+}
+
 /** Removes exactly the given messages from the open folder. This needs a server that can remove messages by number (UIDPLUS). */
 async fn remove_by_uid(session: &mut Session, uids: &[u32]) -> Result<()> {
     if !session.capabilities().await.context("the server did not list its abilities")?.has_str("UIDPLUS") {
@@ -403,12 +430,23 @@ async fn search_uids(session: &mut Session, query: &str) -> Result<Vec<u32>> {
 }
 
 /**
+ * Opens a folder for a change to all its messages. Such a change reads the
+ * message numbers from the server in the same connection, so it does not
+ * use stored numbers, and it needs no check of the folder's numbering mark.
+ * It works also for a folder that the user did not open before.
+ */
+async fn select_for_all(session: &mut Session, path: &str) -> Result<()> {
+    session.select(path).await.context("the server did not open the folder")?;
+    Ok(())
+}
+
+/**
  * Marks all messages of a folder as read on the server. The change goes to
  * exactly the messages that are unread now, in batches, so that one command
  * to the server does not become too long.
  */
-pub async fn set_all_seen(session: &mut Session, path: &str, uid_validity: Option<u32>) -> Result<()> {
-    select_checked(session, path, uid_validity).await?;
+pub async fn set_all_seen(session: &mut Session, path: &str) -> Result<()> {
+    select_for_all(session, path).await?;
     let uids = search_uids(session, "UNSEEN").await?;
     for batch in uids.chunks(CHANGE_BATCH) {
         store_flags(session, batch, "+FLAGS.SILENT (\\Seen)").await?;
@@ -422,8 +460,8 @@ pub async fn set_all_seen(session: &mut Session, path: &str, uid_validity: Optio
  * messages that are in the folder at the start are removed; a message that
  * arrives during the work stays.
  */
-pub async fn remove_all(session: &mut Session, path: &str, uid_validity: Option<u32>, target: Option<&str>) -> Result<()> {
-    select_checked(session, path, uid_validity).await?;
+pub async fn remove_all(session: &mut Session, path: &str, target: Option<&str>) -> Result<()> {
+    select_for_all(session, path).await?;
     let uids = search_uids(session, "ALL").await?;
     for batch in uids.chunks(CHANGE_BATCH) {
         match target {
@@ -461,6 +499,13 @@ mod tests {
         assert_eq!(folder_role("inbox", &[]), "inbox");
         assert_eq!(folder_role("[Gmail]/Sent Mail", &[NameAttribute::Sent]), "sent");
         assert_eq!(folder_role("[Gmail]/Spam", &[NameAttribute::Marked, NameAttribute::Junk]), "junk");
+        /* A server that gives no marks: the name of a top-level folder gives the use. */
+        assert_eq!(folder_role("Deleted", &[NameAttribute::NoInferiors]), "trash");
+        assert_eq!(folder_role("Junk Email", &[]), "junk");
+        assert_eq!(folder_role("Sent Items", &[]), "sent");
+        assert_eq!(folder_role("Work/Trash", &[]), "other");
+        /* A mark wins over the name. */
+        assert_eq!(folder_role("Trash", &[NameAttribute::Archive]), "archive");
         assert_eq!(folder_role("Work", &[NameAttribute::Marked]), "other");
     }
 

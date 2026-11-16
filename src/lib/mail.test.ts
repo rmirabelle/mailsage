@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { formatMessageDate, messageDayGroup, olderFromSender, searchMessages, type MessageHeader } from "./mail";
+import { countAddresses, messagesFromBlocked, senderDomain, formatMessageDate, messageDayGroup, olderFromSender, searchMessages, type MessageHeader } from "./mail";
 
 const seconds = (date: Date) => date.getTime() / 1000;
 
@@ -88,5 +88,36 @@ describe("searchMessages", () => {
   it("needs each word to match", () => {
     expect(uids("ana order")).toEqual([3, 1]);
     expect(uids("ana statement")).toEqual([]);
+  });
+});
+
+describe("countAddresses", () => {
+  it("counts the addresses of a list", () => {
+    expect(countAddresses("")).toBe(0);
+    expect(countAddresses("me@example.com")).toBe(1);
+    expect(countAddresses("Ann <ann@example.com>, bob@example.com; carol@example.com")).toBe(3);
+  });
+  it("does not divide the list at a comma in quotes", () => {
+    expect(countAddresses('"Lee, Carol" <carol@example.com>')).toBe(1);
+    expect(countAddresses('"Lee, Carol" <carol@example.com>, , ')).toBe(1);
+  });
+});
+
+describe("senderDomain", () => {
+  it("gives the domain with the at sign in front", () => {
+    expect(senderDomain("Ann@Example.com")).toBe("@example.com");
+    expect(senderDomain("no-domain")).toBe("");
+    expect(senderDomain("ann@")).toBe("");
+  });
+});
+
+describe("messagesFromBlocked", () => {
+  const from = (uid: number, from_address: string): MessageHeader => ({ uid, subject: "", from_name: "", from_address, date: 0, seen: true, flagged: false, size: 0 });
+  const list = [from(1, "News@Shop.example"), from(2, "sales@shop.example"), from(3, "news@mail.shop.example"), from(4, "")];
+  it("finds the messages of a sender address", () => {
+    expect(messagesFromBlocked(list, "news@shop.example").map((message) => message.uid)).toEqual([1]);
+  });
+  it("finds the messages of a domain, but not of a domain under it", () => {
+    expect(messagesFromBlocked(list, "@shop.example").map((message) => message.uid)).toEqual([1, 2]);
   });
 });

@@ -9,6 +9,8 @@ interface Props {
   busy: boolean;
   error: string | null;
   selectedUid: number | null;
+  /** The other messages that are selected with the Shift key or the Ctrl key. The preview shows `selectedUid` only. */
+  selectedUids: ReadonlySet<number>;
   /** The message whose right-click menu is open. */
   menuUid: number | null;
   /** The setting: only the most recent day group starts open. */
@@ -22,7 +24,12 @@ interface Props {
   onLoadOlder: () => void;
   /** The user typed a search text: search the full folder on the server also. */
   onSearch: (text: string) => void;
-  onSelect: (message: MessageHeader) => void;
+  /** A click on a message. With "toggle" (the Ctrl key), the message goes into the selection or out of it. */
+  onSelect: (message: MessageHeader, mode: "single" | "toggle") => void;
+  /** A click with the Shift key: select these messages, from the selected one to the clicked one. */
+  onSelectRange: (messages: MessageHeader[]) => void;
+  /** A click on the star of a message: remove the star. */
+  onUnstar: (message: MessageHeader) => void;
   /** A right-click on a message: open its menu at the mouse. */
   onMenu: (message: MessageHeader, position: { left: number; top: number }) => void;
   onRefresh: () => void;
@@ -40,7 +47,7 @@ const MIN_SERVER_SEARCH_LENGTH = 2;
  * it opens a block under the message with those older messages. An older
  * message shows only there, and not at its own date.
  */
-export function MessageList({ folder, messages, busy, error, selectedUid, menuUid, collapsePreviousDays, hasOlder, olderBusy, searchBusy, onLoadOlder, onSearch, onSelect, onMenu, onRefresh }: Props) {
+export function MessageList({ folder, messages, busy, error, selectedUid, selectedUids, menuUid, collapsePreviousDays, hasOlder, olderBusy, searchBusy, onLoadOlder, onSearch, onSelect, onSelectRange, onUnstar, onMenu, onRefresh }: Props) {
   /** The messages whose sender block is open. */
   const [expanded, setExpanded] = useState<ReadonlySet<number>>(new Set());
   const folderId = folder?.id ?? null;
@@ -51,7 +58,19 @@ export function MessageList({ folder, messages, busy, error, selectedUid, menuUi
   const [search, setSearch] = useState("");
   useEffect(() => setSearch(""), [folderId]);
   const searching = search.trim() !== "";
-  const shown = useMemo(() => searchMessages(messages, search), [messages, search]);
+  /**
+   * The filter for unread messages. While it is on, the list shows only the
+   * unread messages, and the selected one: a message becomes read when the
+   * user opens it, and it must not go out of the list at that moment.
+   */
+  const [unreadOnly, setUnreadOnly] = useState(false);
+  useEffect(() => setUnreadOnly(false), [folderId]);
+  const shown = useMemo(() => {
+    const found = searchMessages(messages, search);
+    return unreadOnly ? found.filter((message) => !message.seen || message.uid === selectedUid) : found;
+  }, [messages, search, unreadOnly, selectedUid]);
+  /** True while the search or the unread filter makes the list shorter. */
+  const narrowed = searching || unreadOnly;
 
   /**
    * The list holds only a part of the folder, so the server searches the
@@ -99,9 +118,9 @@ export function MessageList({ folder, messages, busy, error, selectedUid, menuUi
    * or the start or end of a search starts with the defaults again.
    */
   const [toggledDays, setToggledDays] = useState<ReadonlySet<string>>(new Set());
-  useEffect(() => setToggledDays(new Set()), [folderId, collapsePreviousDays, searching]);
-  /** By default all groups are open, or with the setting, only the most recent one. A search opens all groups. */
-  const closedByDefault = (index: number) => collapsePreviousDays && !searching && index > 0;
+  useEffect(() => setToggledDays(new Set()), [folderId, collapsePreviousDays, narrowed]);
+  /** By default all groups are open, or with the setting, only the most recent one. A search or the unread filter opens all groups. */
+  const closedByDefault = (index: number) => collapsePreviousDays && !narrowed && index > 0;
   const isDayClosed = (label: string, index: number) => closedByDefault(index) !== toggledDays.has(label);
   /** Opens all day groups, or closes all of them. */
   const setAllDays = (closed: boolean) => {
@@ -123,13 +142,40 @@ export function MessageList({ folder, messages, busy, error, selectedUid, menuUi
     });
   };
 
+  /** The messages that show now, from top to bottom: not those of a closed day, and not those of a closed sender block. */
+  const visibleOrder = () => {
+    const order: MessageHeader[] = [];
+    dayGroups.forEach((group, index) => {
+      if (isDayClosed(group.label, index)) return;
+      for (const message of group.messages) {
+        order.push(message);
+        if (expanded.has(message.uid)) order.push(...(bySender.get(senderKey(message)) ?? []).slice(1));
+      }
+    });
+    return order;
+  };
+
+  /** A click with Shift selects from the selected message to this one. A click with Ctrl adds or removes this one. */
+  const select = (message: MessageHeader, event: { shiftKey: boolean; ctrlKey: boolean }) => {
+    if (event.shiftKey && selectedUid !== null) {
+      const order = visibleOrder();
+      const from = order.findIndex((entry) => entry.uid === selectedUid);
+      const to = order.findIndex((entry) => entry.uid === message.uid);
+      if (from >= 0 && to >= 0) {
+        onSelectRange(order.slice(Math.min(from, to), Math.max(from, to) + 1));
+        return;
+      }
+    }
+    onSelect(message, event.ctrlKey ? "toggle" : "single");
+  };
+
   const row = (message: MessageHeader, nested: boolean) => (
     <button
       key={message.uid}
       role="option"
-      aria-selected={message.uid === selectedUid}
-      className={`message-row ${nested ? "nested" : ""} ${message.seen ? "" : "unread"} ${message.uid === selectedUid ? "selected" : ""} ${message.uid === menuUid ? "context" : ""}`}
-      onClick={() => onSelect(message)}
+      aria-selected={message.uid === selectedUid || selectedUids.has(message.uid)}
+      className={`message-row ${nested ? "nested" : ""} ${message.seen ? "" : "unread"} ${message.uid === selectedUid || selectedUids.has(message.uid) ? "selected" : ""} ${message.uid === menuUid ? "context" : ""}`}
+      onClick={(event) => select(message, event)}
       onContextMenu={(event) => {
         event.preventDefault();
         onMenu(message, { left: event.clientX, top: event.clientY });
@@ -138,7 +184,21 @@ export function MessageList({ folder, messages, busy, error, selectedUid, menuUi
       <span className="message-sender">{message.from_name || message.from_address || "(no sender)"}</span>
       <span className="message-date">{formatMessageDate(message.date)}</span>
       <span className="message-subject">{message.subject || "(no subject)"}</span>
-      {message.flagged && <Star className="message-flag" size={13} weight="fill" />}
+      {message.flagged && (
+        /* The row is a button, and a button cannot hold a second button. So the star is a span that takes the click before the row gets it. */
+        <span
+          className="message-flag"
+          role="button"
+          aria-label="Remove star"
+          title="Remove star"
+          onClick={(event) => {
+            event.stopPropagation();
+            onUnstar(message);
+          }}
+        >
+          <Star size={13} weight="fill" />
+        </span>
+      )}
     </button>
   );
 
@@ -191,14 +251,29 @@ export function MessageList({ folder, messages, busy, error, selectedUid, menuUi
             </button>
           )}
         </div>
+        <button
+          className={`filter-button ${unreadOnly ? "active" : ""}`}
+          onClick={() => setUnreadOnly((current) => !current)}
+          aria-pressed={unreadOnly}
+          title={unreadOnly ? "Show all emails" : "Show only unread emails"}
+        >
+          <EnvelopeSimple size={14} weight={unreadOnly ? "fill" : "regular"} /> Unread
+        </button>
       </div>
       {shown.length === 0 ? (
         <div className="pane-empty">
           {searching ? <MagnifyingGlass size={30} /> : <EnvelopeSimple size={30} />}
-          <p>{searching ? (searchBusy ? "Searching the full folder…" : "No message matches the search.") : busy ? "Reading messages…" : "This folder has no messages."}</p>
+          <p>{searching
+            ? (searchBusy ? "Searching the full folder…" : unreadOnly ? "No unread message matches the search." : "No message matches the search.")
+            : busy ? "Reading messages…" : unreadOnly ? "No unread messages in the list." : "This folder has no messages."}</p>
+          {!searching && unreadOnly && hasOlder && (
+            <button className="list-more" disabled={olderBusy} onClick={onLoadOlder}>
+              {olderBusy ? <><CircleNotch className="spin" size={13} /> Reading older emails…</> : "Load older emails"}
+            </button>
+          )}
         </div>
       ) : (
-        <div className="message-list" role="listbox" aria-label={`Messages in ${folder.name}`}>
+        <div className="message-list" role="listbox" aria-multiselectable="true" aria-label={`Messages in ${folder.name}`}>
           {dayGroups.map((group, index) => {
             const closed = isDayClosed(group.label, index);
             return (

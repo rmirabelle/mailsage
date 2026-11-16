@@ -10,7 +10,10 @@ use anyhow::{bail, Context, Result};
 use rusqlite::{params, Connection, OptionalExtension};
 use serde::Serialize;
 
-const SCHEMA_VERSION: i64 = 2;
+const SCHEMA_VERSION: i64 = 3;
+
+/** Added in version 3: the block list (blocklist.rs). An entry is an address, or a domain with the at sign in front. */
+const BLOCKED_SENDERS_SCHEMA: &str = "CREATE TABLE blocked_senders (entry TEXT PRIMARY KEY COLLATE NOCASE);";
 
 /** Added in version 2: the senders whose remote images always load. */
 const TRUSTED_SENDERS_SCHEMA: &str = "CREATE TABLE trusted_senders (address TEXT PRIMARY KEY COLLATE NOCASE);";
@@ -141,8 +144,9 @@ impl Store {
         connection.pragma_update(None, "foreign_keys", true)?;
         let version: i64 = connection.query_row("PRAGMA user_version", [], |row| row.get(0))?;
         match version {
-            0 => connection.execute_batch(&format!("{SCHEMA}{TRUSTED_SENDERS_SCHEMA}"))?,
-            1 => connection.execute_batch(TRUSTED_SENDERS_SCHEMA)?,
+            0 => connection.execute_batch(&format!("{SCHEMA}{TRUSTED_SENDERS_SCHEMA}{BLOCKED_SENDERS_SCHEMA}"))?,
+            1 => connection.execute_batch(&format!("{TRUSTED_SENDERS_SCHEMA}{BLOCKED_SENDERS_SCHEMA}"))?,
+            2 => connection.execute_batch(BLOCKED_SENDERS_SCHEMA)?,
             SCHEMA_VERSION => {}
             _ => bail!("the mail store has version {version}, and this Mail Sage reads version {SCHEMA_VERSION}"),
         }
@@ -300,6 +304,21 @@ impl Store {
         Ok(())
     }
 
+    /** The block list, in order of the alphabet. */
+    pub fn blocked(&self) -> Result<Vec<String>> {
+        let connection = self.lock();
+        let mut statement = connection.prepare("SELECT entry FROM blocked_senders ORDER BY entry COLLATE NOCASE")?;
+        let rows = statement.query_map([], |row| row.get(0))?;
+        Ok(rows.collect::<rusqlite::Result<_>>()?)
+    }
+
+    /** Adds an entry to the block list, or removes it. The entry is clean already (blocklist::normalize). */
+    pub fn set_blocked(&self, entry: &str, blocked: bool) -> Result<()> {
+        let statement = if blocked { "INSERT OR IGNORE INTO blocked_senders (entry) VALUES (?1)" } else { "DELETE FROM blocked_senders WHERE entry = ?1" };
+        self.lock().execute(statement, [entry])?;
+        Ok(())
+    }
+
     /** The server's numbering mark of a folder, as stored with its messages. */
     pub fn folder_uid_validity(&self, folder_id: i64) -> Result<Option<u32>> {
         self.lock()
@@ -338,6 +357,17 @@ impl Store {
         }
         let change = if seen { -changed } else { changed };
         transaction.execute("UPDATE folders SET unread = MAX(0, unread + ?2) WHERE id = ?1", params![folder_id, change])?;
+        transaction.commit()?;
+        Ok(())
+    }
+
+    /** Puts the star on stored messages, or removes it, after the server did the same. */
+    pub fn mark_flagged(&self, folder_id: i64, uids: &[u32], flagged: bool) -> Result<()> {
+        let mut connection = self.lock();
+        let transaction = connection.transaction()?;
+        for uid in uids {
+            transaction.execute("UPDATE messages SET flagged = ?3 WHERE folder_id = ?1 AND uid = ?2", params![folder_id, uid, flagged])?;
+        }
         transaction.commit()?;
         Ok(())
     }
@@ -485,6 +515,42 @@ mod tests {
         /* The server numbered the folder again: all the old messages go. */
         store.save_messages(inbox, Some(8), 1, &[header(1, 500)]).unwrap();
         assert_eq!(uids(&store), [1]);
+    }
+
+    #[test]
+    fn puts_the_star_on_a_message_and_removes_it() {
+        let store = Store::open_in_memory().unwrap();
+        let account = store.add_account("gmail", "me@example.com", "imap.gmail.com", 993).unwrap();
+        store.replace_folders(account.id, &[folder("INBOX", "inbox")]).unwrap();
+        let inbox = store.folders(account.id).unwrap()[0].id;
+        store.save_messages(inbox, Some(1), 1, &[header(1, 10), header(2, 20)]).unwrap();
+        store.mark_flagged(inbox, &[2], true).unwrap();
+        let flagged: Vec<(u32, bool)> = store.messages(inbox, 10).unwrap().iter().map(|message| (message.uid, message.flagged)).collect();
+        assert_eq!(flagged, [(2, true), (1, false)]);
+        store.mark_flagged(inbox, &[2], false).unwrap();
+        assert!(store.messages(inbox, 10).unwrap().iter().all(|message| !message.flagged));
+    }
+
+    #[test]
+    fn keeps_the_block_list() {
+        let store = Store::open_in_memory().unwrap();
+        assert!(store.blocked().unwrap().is_empty());
+        store.set_blocked("news@shop.example", true).unwrap();
+        store.set_blocked("@ads.example", true).unwrap();
+        store.set_blocked("news@shop.example", true).unwrap();
+        assert_eq!(store.blocked().unwrap(), ["@ads.example", "news@shop.example"]);
+        store.set_blocked("@ads.example", false).unwrap();
+        assert_eq!(store.blocked().unwrap(), ["news@shop.example"]);
+    }
+
+    #[test]
+    fn upgrades_a_version_2_store() {
+        let connection = Connection::open_in_memory().unwrap();
+        connection.execute_batch(&format!("{SCHEMA}{TRUSTED_SENDERS_SCHEMA}")).unwrap();
+        connection.pragma_update(None, "user_version", 2).unwrap();
+        let store = Store::prepare(connection).unwrap();
+        store.set_blocked("a@example.com", true).unwrap();
+        assert_eq!(store.blocked().unwrap(), ["a@example.com"]);
     }
 
     #[test]

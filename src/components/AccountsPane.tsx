@@ -16,6 +16,8 @@ import {
   X
 } from "@phosphor-icons/react";
 import { useState, type ReactNode } from "react";
+import type { AccountLabels } from "../lib/accountLabels";
+import { folderKey, folderRows, loadClosedFolders, saveClosedFolders } from "../lib/folders";
 import type { Account, Folder, FolderRole } from "../lib/mail";
 
 interface Props {
@@ -25,6 +27,14 @@ interface Props {
   busyAccountIds: ReadonlySet<number>;
   /** The last folder-list error of each account. */
   accountErrors: ReadonlyMap<number, string>;
+  /** The labels that the user gave to accounts. An account with no label shows its email address. */
+  accountLabels: AccountLabels;
+  /** A right-click on an account: open its menu at the mouse. */
+  onAccountMenu: (account: Account, position: { left: number; top: number }) => void;
+  /** The folders that the user hid (keys from `folderKey`). */
+  hiddenFolders: ReadonlySet<string>;
+  /** True while the hidden folders show also, in a dim colour. */
+  showHidden: boolean;
   onSelectFolder: (folder: Folder) => void;
   /** A right-click on a folder: open its menu at the mouse. */
   onFolderMenu: (folder: Folder, position: { left: number; top: number }) => void;
@@ -47,8 +57,20 @@ const ROLE_ICONS: Record<FolderRole, ReactNode> = {
 };
 
 /** The left pane: one group for each account, with its folders and unread counts. */
-export function AccountsPane({ accounts, selectedFolderId, busyAccountIds, accountErrors, onSelectFolder, onFolderMenu, onAddAccount, onNewMessage, onRefreshAccount, onRemoveAccount }: Props) {
+export function AccountsPane({ accounts, selectedFolderId, busyAccountIds, accountErrors, accountLabels, onAccountMenu, hiddenFolders, showHidden, onSelectFolder, onFolderMenu, onAddAccount, onNewMessage, onRefreshAccount, onRemoveAccount }: Props) {
   const [collapsed, setCollapsed] = useState<ReadonlySet<number>>(new Set());
+
+  /** The folders that the user closed: the folders under them do not show. This is saved. */
+  const [closedFolders, setClosedFolders] = useState<ReadonlySet<string>>(loadClosedFolders);
+  const toggleFolder = (folder: Folder) => {
+    setClosedFolders((current) => {
+      const next = new Set(current);
+      const key = folderKey(folder);
+      if (!next.delete(key)) next.add(key);
+      saveClosedFolders(next);
+      return next;
+    });
+  };
 
   const toggle = (accountId: number) => {
     setCollapsed((current) => {
@@ -87,10 +109,16 @@ export function AccountsPane({ accounts, selectedFolderId, busyAccountIds, accou
             const error = accountErrors.get(account.id);
             return (
               <section className="account-group" key={account.id}>
-                <header className="account-header">
+                <header
+                  className="account-header"
+                  onContextMenu={(event) => {
+                    event.preventDefault();
+                    onAccountMenu(account, { left: event.clientX, top: event.clientY });
+                  }}
+                >
                   <button className="account-toggle" onClick={() => toggle(account.id)} aria-expanded={open} title={account.email}>
                     {open ? <CaretDown size={12} /> : <CaretRight size={12} />}
-                    <span>{account.email}</span>
+                    <span>{accountLabels[account.id] ?? account.email}</span>
                   </button>
                   {busy
                     ? <CircleNotch className="spin account-busy" size={14} />
@@ -106,22 +134,34 @@ export function AccountsPane({ accounts, selectedFolderId, busyAccountIds, accou
                     )}
                 </header>
                 {open && error && <p className="account-error selectable">{error}</p>}
-                {open && account.folders.map((folder) => (
-                  <button
-                    key={folder.id}
-                    className={`folder-row ${folder.id === selectedFolderId ? "selected" : ""}`}
-                    style={{ paddingLeft: 26 + folder.depth * 14 }}
-                    disabled={!folder.selectable}
-                    onClick={() => onSelectFolder(folder)}
-                    onContextMenu={(event) => {
-                      event.preventDefault();
-                      if (folder.selectable) onFolderMenu(folder, { left: event.clientX, top: event.clientY });
-                    }}
-                  >
-                    {ROLE_ICONS[folder.role] ?? ROLE_ICONS.other}
-                    <span className="folder-name">{folder.name}</span>
-                    {folder.unread > 0 && <span className="folder-unread">{folder.unread}</span>}
-                  </button>
+                {open && folderRows(account.folders, closedFolders, hiddenFolders, showHidden).map(({ folder, depth, hasChildren, closed, hidden }) => (
+                  <div className="folder-entry" key={folder.id}>
+                    {hasChildren && (
+                      <button
+                        className="folder-expand"
+                        style={{ left: 7 + depth * 14 }}
+                        onClick={() => toggleFolder(folder)}
+                        aria-expanded={!closed}
+                        aria-label={closed ? `Show the folders in ${folder.name}` : `Hide the folders in ${folder.name}`}
+                      >
+                        {closed ? <CaretRight size={11} weight="bold" /> : <CaretDown size={11} weight="bold" />}
+                      </button>
+                    )}
+                    <button
+                      className={`folder-row ${folder.id === selectedFolderId ? "selected" : ""} ${folder.selectable ? "" : "no-mail"} ${hidden ? "hidden-folder" : ""}`}
+                      style={{ paddingLeft: 26 + depth * 14 }}
+                      /* A folder that cannot hold messages only opens and closes. */
+                      onClick={() => folder.selectable ? onSelectFolder(folder) : toggleFolder(folder)}
+                      onContextMenu={(event) => {
+                        event.preventDefault();
+                        onFolderMenu(folder, { left: event.clientX, top: event.clientY });
+                      }}
+                    >
+                      {ROLE_ICONS[folder.role] ?? ROLE_ICONS.other}
+                      <span className="folder-name">{folder.name}</span>
+                      {folder.unread > 0 && <span className="folder-unread">{folder.unread}</span>}
+                    </button>
+                  </div>
                 ))}
               </section>
             );

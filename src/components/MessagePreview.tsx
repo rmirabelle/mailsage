@@ -1,6 +1,6 @@
-import { ArrowBendDoubleUpLeft, ArrowBendUpLeft, ArrowBendUpRight, CircleNotch, Envelope, Paperclip, ShieldCheck, Trash, Warning, WarningCircle } from "@phosphor-icons/react";
+import { ArrowBendDoubleUpLeft, ArrowBendUpLeft, ArrowBendUpRight, CircleNotch, Envelope, Paperclip, ShieldCheck, Star, Trash, Warning, WarningCircle } from "@phosphor-icons/react";
 import { useCallback, useEffect, useRef, useState } from "react";
-import { checkLink, formatFileSize, openMessage, saveAttachment, setSenderTrusted, type AttachmentInfo, type LinkCheck, type MessageHeader, type MessageView, type ReplyMode } from "../lib/mail";
+import { checkLink, countAddresses, formatFileSize, openMessage, saveAttachment, setSenderTrusted, type AttachmentInfo, type LinkCheck, type MessageHeader, type MessageView, type ReplyMode } from "../lib/mail";
 import { ConfirmDialog } from "./ConfirmDialog";
 import { LinkDialog } from "./LinkDialog";
 
@@ -12,6 +12,8 @@ interface Props {
   /** Called one time when the message text shows. The message then becomes "read". */
   onOpened: () => void;
   onMarkUnread: () => void;
+  /** Puts the star on the message, or removes it. */
+  onStar: (flagged: boolean) => void;
   onReply: (mode: ReplyMode) => void;
   onDelete: () => void;
 }
@@ -26,7 +28,7 @@ type Notice = { kind: "info" | "error"; text: string };
  * It has "allow-same-origin" only so that this component can catch a click
  * on a link; a link never opens by the click alone.
  */
-export function MessagePreview({ folderId, message, inTrash, onOpened, onMarkUnread, onReply, onDelete }: Props) {
+export function MessagePreview({ folderId, message, inTrash, onOpened, onMarkUnread, onStar, onReply, onDelete }: Props) {
   const [view, setView] = useState<MessageView | null>(null);
   const [busy, setBusy] = useState(true);
   const [error, setError] = useState<string | null>(null);
@@ -121,9 +123,21 @@ export function MessagePreview({ folderId, message, inTrash, onOpened, onMarkUnr
       <header className="preview-header">
         <div className="preview-actions">
           <button className="icon-button" onClick={() => onReply("reply")} disabled={!view} aria-label="Reply" title="Reply"><ArrowBendUpLeft size={16} /></button>
-          <button className="icon-button" onClick={() => onReply("reply_all")} disabled={!view} aria-label="Reply to all" title="Reply to all"><ArrowBendDoubleUpLeft size={16} /></button>
+          {/* "Reply to all" is of use only when the message went to more people than the user. */}
+          {view && countAddresses(view.to) + countAddresses(view.cc) > 1 && (
+            <button className="icon-button" onClick={() => onReply("reply_all")} aria-label="Reply to all" title="Reply to all"><ArrowBendDoubleUpLeft size={16} /></button>
+          )}
           <button className="icon-button" onClick={() => onReply("forward")} disabled={!view} aria-label="Forward" title="Forward"><ArrowBendUpRight size={16} /></button>
           <button className="icon-button" onClick={onMarkUnread} disabled={!message.seen} aria-label="Mark as unread" title="Mark as unread"><Envelope size={16} /></button>
+          <button
+            className={`icon-button ${message.flagged ? "starred" : ""}`}
+            onClick={() => onStar(!message.flagged)}
+            aria-pressed={message.flagged}
+            aria-label={message.flagged ? "Remove star" : "Add star"}
+            title={message.flagged ? "Remove star" : "Add star"}
+          >
+            <Star size={16} weight={message.flagged ? "fill" : "regular"} />
+          </button>
           <button className="icon-button" onClick={onDelete} aria-label={inTrash ? "Delete for good" : "Delete"} title={inTrash ? "Delete for good" : "Delete (Del)"}><Trash size={16} /></button>
         </div>
         <h2 className="preview-subject selectable">{(view?.subject ?? message.subject) || "(no subject)"}</h2>

@@ -1,6 +1,6 @@
 /**
  * Writing mail: builds a message, sends it through the account's SMTP
- * server, and makes the starting text of a reply or a forward.
+ * server (always encrypted), and makes the starting text of a reply or a forward.
  *
  * A message from Mail Sage is plain text. It names no mail program and no
  * computer: there is no "User-Agent" header, and the message id and the
@@ -130,9 +130,22 @@ pub fn build(from: &str, outgoing: &Outgoing, files: Vec<(String, Vec<u8>)>) -> 
     message.context("Mail Sage could not build the message")
 }
 
-/** Sends a message through an SMTP server with an OAuth access token. The connection is encrypted from the first byte (port 465). */
-pub async fn send_with_token(host: &str, email: &str, access_token: &str, message: Message) -> Result<()> {
-    let mailer = AsyncSmtpTransport::<Tokio1Executor>::relay(host)
+/** How the connection to an SMTP server becomes encrypted. Mail Sage does not send on a connection that is not encrypted. */
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum Encryption {
+    /** Encrypted from the first byte (port 465). */
+    FromStart,
+    /** Starts plain and changes to encrypted before the sign-in (STARTTLS, port 587). If the server cannot do that, the send fails. */
+    StartTls,
+}
+
+/** Sends a message through an SMTP server with an OAuth access token. */
+pub async fn send_with_token(host: &str, encryption: Encryption, email: &str, access_token: &str, message: Message) -> Result<()> {
+    let transport = match encryption {
+        Encryption::FromStart => AsyncSmtpTransport::<Tokio1Executor>::relay(host),
+        Encryption::StartTls => AsyncSmtpTransport::<Tokio1Executor>::starttls_relay(host),
+    };
+    let mailer = transport
         .map_err(|error| anyhow!("could not prepare the connection to {host}: {error}"))?
         .credentials(Credentials::new(email.to_string(), access_token.to_string()))
         .authentication(vec![Mechanism::Xoauth2])
