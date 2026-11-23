@@ -41,6 +41,10 @@ export const addMicrosoftAccount = (work: boolean) => invoke<Omit<Account, "fold
 export const listAccounts = () => invoke<Account[]>("list_accounts");
 /** Opens the Google sign-in in the browser. It resolves when the sign-in is complete. */
 export const addGmailAccount = () => invoke<Omit<Account, "folders">>("add_gmail_account");
+/** Tests a Gmail app password on Google's server and adds the account, or changes a Gmail account with the same address to it. */
+export const addGmailAppPassword = (email: string, appPassword: string) => invoke<Omit<Account, "folders">>("add_gmail_app_password", { email, appPassword });
+/** True for a Gmail account, with the Google sign-in or with an app password. */
+export const isGmail = (kind: string | undefined) => kind === "gmail" || kind === "gmail-password";
 export const cancelSignIn = () => invoke<void>("cancel_sign_in");
 export const removeAccount = (accountId: number) => invoke<void>("remove_account", { accountId });
 export const syncFolders = (accountId: number) => invoke<Folder[]>("sync_folders", { accountId });

@@ -81,6 +81,7 @@ pub fn run() {
             accounts::microsoft_sign_in_ready,
             accounts::list_accounts,
             accounts::add_gmail_account,
+            accounts::add_gmail_app_password,
             accounts::add_microsoft_account,
             accounts::cancel_sign_in,
             accounts::remove_account,

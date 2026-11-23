@@ -29,6 +29,7 @@ import {
   messagesFromBlocked,
   moveMessagesTo,
   moveToInbox,
+  isGmail,
   loadOlderMessages,
   markFolderSeen,
   olderFromSender,
@@ -53,6 +54,8 @@ import { checkForUpdate, getAppVersion, type UpdateInfo } from "./lib/updater";
 
 /** How many of a folder's newest messages load into memory when the folder opens. */
 const PREFETCH_AT_OPEN = 15;
+/** How many of the newest messages of each inbox load into memory at start. */
+const PREFETCH_AT_START = 5;
 /** How many messages under and above the selected one load into memory. */
 const PREFETCH_BELOW = 6;
 const PREFETCH_ABOVE = 2;
@@ -318,16 +321,35 @@ export default function App() {
     }
   }, []);
 
-  /* At start: one quiet update check, then the stored accounts, then a fresh folder list for each. */
+  /**
+   * Reads the new mail of an account's inbox into the store, and loads the
+   * newest few messages into memory. Then a click on the inbox shows the
+   * list at once, and the first message opens at once. An error here shows
+   * when the user opens the inbox.
+   */
+  const readInbox = useCallback(async (folders: Folder[]) => {
+    const inbox = folders.find((folder) => folder.role === "inbox");
+    if (!inbox) return;
+    try {
+      const fresh = await syncMessages(inbox.id);
+      void prefetchMessages(inbox.id, fresh.slice(0, PREFETCH_AT_START).map((message) => message.uid));
+    } catch {
+      /* The user sees the error when the inbox opens. */
+    }
+  }, []);
+
+  /* At start: one quiet update check, then the stored accounts, then a fresh folder list and the new inbox mail for each. */
   useEffect(() => {
     if (!isTauri()) return;
     void getAppVersion().then(setVersion).catch(() => undefined);
     void checkForUpdate().then(setStartupUpdate).catch(() => undefined);
     void listAccounts().then((stored) => {
       setAccounts(stored);
-      for (const account of stored) void refreshFolders(account.id);
+      for (const account of stored) {
+        void refreshFolders(account.id).then((folders) => folders && readInbox(folders));
+      }
     }).catch(() => undefined);
-  }, [refreshFolders]);
+  }, [refreshFolders, readInbox]);
 
   const accountAdded = async (accountId: number) => {
     setAddAccountOpen(false);
@@ -818,7 +840,7 @@ export default function App() {
           onConfirm={() => { const folder = folderToDelete; setFolderToDelete(null); void removeFolder(folder); }}
           onCancel={() => setFolderToDelete(null)}
         >
-          {accounts.find((account) => account.id === folderToDelete.account_id)?.kind === "gmail"
+          {isGmail(accounts.find((account) => account.id === folderToDelete.account_id)?.kind)
             ? "This deletes the folder from Gmail. Gmail keeps its emails in All Mail."
             : `This deletes the folder and its ${emailCount(folderToDelete.total)} from the server for good. They cannot come back.`}
           {" "}To only take the folder out of the list, cancel and use "Hide folder".

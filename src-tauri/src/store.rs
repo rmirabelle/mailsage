@@ -3,6 +3,7 @@
  * accounts, folders, and message headers. It never holds passwords or
  * sign-in tokens (see secrets.rs).
  */
+use std::collections::HashSet;
 use std::path::Path;
 use std::sync::Mutex;
 
@@ -115,6 +116,14 @@ pub struct Store {
 }
 
 /** Stores one message header, or replaces the stored one with the same number. */
+/** A message number with the message's read and flag marks. */
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Marks {
+    pub uid: u32,
+    pub seen: bool,
+    pub flagged: bool,
+}
+
 fn store_header(transaction: &rusqlite::Transaction<'_>, folder_id: i64, header: &MessageHeader) -> Result<()> {
     transaction.execute(
         "INSERT INTO messages (folder_id, uid, subject, from_name, from_address, date, seen, flagged, size)
@@ -170,6 +179,20 @@ impl Store {
             .query_row("SELECT id, kind, email, imap_host, imap_port FROM accounts WHERE id = ?1", [id], account_from_row)
             .optional()?
             .context("the account does not exist")
+    }
+
+    /** The account with this email address (the case of the letters does not matter), if there is one. */
+    pub fn account_by_email(&self, email: &str) -> Result<Option<Account>> {
+        Ok(self
+            .lock()
+            .query_row("SELECT id, kind, email, imap_host, imap_port FROM accounts WHERE email = ?1 COLLATE NOCASE", [email], account_from_row)
+            .optional()?)
+    }
+
+    /** Changes how an account signs in. Its folders and messages stay. */
+    pub fn set_account_kind(&self, id: i64, kind: &str) -> Result<()> {
+        self.lock().execute("UPDATE accounts SET kind = ?1 WHERE id = ?2", params![kind, id])?;
+        Ok(())
     }
 
     pub fn add_account(&self, kind: &str, email: &str, imap_host: &str, imap_port: u16) -> Result<Account> {
@@ -243,14 +266,31 @@ impl Store {
         Ok(())
     }
 
-    /**
-     * Stores the newest messages of a folder, as fetched from the server.
-     * `uid_validity` is the server's mark for the folder's numbering: when it
-     * changes, all stored message numbers are void, so the folder is emptied
-     * first. A stored message from `lowest_uid` up that is not in `headers`
-     * was deleted on the server, so it goes.
-     */
+    /** Stores the newest messages of a folder with full headers for each: `merge_messages` with all of them new. */
+    #[cfg(test)]
     pub fn save_messages(&self, folder_id: i64, uid_validity: Option<u32>, lowest_uid: u32, headers: &[MessageHeader]) -> Result<()> {
+        let present: Vec<Marks> = headers.iter().map(|header| Marks { uid: header.uid, seen: header.seen, flagged: header.flagged }).collect();
+        self.merge_messages(folder_id, uid_validity, lowest_uid, &present, headers)
+    }
+
+    /** The numbers of all stored messages of a folder. */
+    pub fn message_uids(&self, folder_id: i64) -> Result<HashSet<u32>> {
+        let connection = self.lock();
+        let mut statement = connection.prepare("SELECT uid FROM messages WHERE folder_id = ?1")?;
+        let uids = statement.query_map([folder_id], |row| row.get(0))?.collect::<rusqlite::Result<HashSet<u32>>>()?;
+        Ok(uids)
+    }
+
+    /**
+     * Stores the newest messages of a folder, from a fetch that got full
+     * headers only for the new messages. `uid_validity` is the server's mark
+     * for the folder's numbering: when it changes, all stored message
+     * numbers are void, so the folder is emptied first. `present` has each
+     * message from `lowest_uid` up with its marks; a stored message in that
+     * range that is not in `present` was deleted on the server, so it goes.
+     * `headers` are the new messages.
+     */
+    pub fn merge_messages(&self, folder_id: i64, uid_validity: Option<u32>, lowest_uid: u32, present: &[Marks], headers: &[MessageHeader]) -> Result<()> {
         let mut connection = self.lock();
         let transaction = connection.transaction()?;
         let stored_validity: Option<u32> = transaction.query_row("SELECT uid_validity FROM folders WHERE id = ?1", [folder_id], |row| row.get(0))?;
@@ -258,13 +298,19 @@ impl Store {
             transaction.execute("DELETE FROM messages WHERE folder_id = ?1", [folder_id])?;
             transaction.execute("UPDATE folders SET uid_validity = ?2 WHERE id = ?1", params![folder_id, uid_validity])?;
         }
-        if headers.is_empty() {
+        if present.is_empty() {
             transaction.execute("DELETE FROM messages WHERE folder_id = ?1", [folder_id])?;
         } else {
-            let kept = headers.iter().map(|header| header.uid.to_string()).collect::<Vec<_>>().join(",");
+            let kept = present.iter().map(|marks| marks.uid.to_string()).collect::<Vec<_>>().join(",");
             transaction.execute(
                 &format!("DELETE FROM messages WHERE folder_id = ?1 AND uid >= ?2 AND uid NOT IN ({kept})"),
                 params![folder_id, lowest_uid],
+            )?;
+        }
+        for marks in present {
+            transaction.execute(
+                "UPDATE messages SET seen = ?3, flagged = ?4 WHERE folder_id = ?1 AND uid = ?2",
+                params![folder_id, marks.uid, marks.seen, marks.flagged],
             )?;
         }
         for header in headers {
@@ -487,6 +533,19 @@ mod tests {
     }
 
     #[test]
+    fn changes_the_kind_of_an_account_and_keeps_its_folders() {
+        let store = Store::open_in_memory().unwrap();
+        let account = store.add_account("gmail", "me@example.com", "imap.gmail.com", 993).unwrap();
+        store.replace_folders(account.id, &[folder("INBOX", "inbox")]).unwrap();
+        let found = store.account_by_email("ME@example.com").unwrap().unwrap();
+        assert_eq!(found.id, account.id);
+        store.set_account_kind(account.id, "gmail-password").unwrap();
+        assert_eq!(store.account(account.id).unwrap().kind, "gmail-password");
+        assert_eq!(store.folders(account.id).unwrap().len(), 1);
+        assert!(store.account_by_email("other@example.com").unwrap().is_none());
+    }
+
+    #[test]
     fn orders_folders_and_drops_the_ones_the_server_lost() {
         let store = Store::open_in_memory().unwrap();
         let account = store.add_account("gmail", "me@example.com", "imap.gmail.com", 993).unwrap();
@@ -495,6 +554,28 @@ mod tests {
         assert_eq!(names, ["INBOX", "Trash", "Work"]);
         store.replace_folders(account.id, &[folder("INBOX", "inbox")]).unwrap();
         assert_eq!(store.folders(account.id).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn merges_marks_and_new_messages() {
+        let store = Store::open_in_memory().unwrap();
+        let account = store.add_account("gmail", "me@example.com", "imap.gmail.com", 993).unwrap();
+        store.replace_folders(account.id, &[folder("INBOX", "inbox")]).unwrap();
+        let inbox = store.folders(account.id).unwrap().remove(0).id;
+        store.save_messages(inbox, Some(7), 1, &[header(1, 100), header(2, 200), header(3, 300)]).unwrap();
+        assert_eq!(store.message_uids(inbox).unwrap(), HashSet::from([1, 2, 3]));
+
+        /* Message 2 is gone, message 3 is now read, and message 4 is new. */
+        let marks = |uid, seen| Marks { uid, seen, flagged: false };
+        store.merge_messages(inbox, Some(7), 1, &[marks(1, false), marks(3, true), marks(4, false)], &[header(4, 400)]).unwrap();
+        let listed = store.messages(inbox, 50).unwrap();
+        assert_eq!(listed.iter().map(|message| message.uid).collect::<Vec<_>>(), [4, 3, 1]);
+        assert!(listed.iter().find(|message| message.uid == 3).unwrap().seen);
+        assert_eq!(listed[1].subject, "Subject 3");
+
+        /* A new numbering on the server empties the folder first. */
+        store.merge_messages(inbox, Some(8), 1, &[marks(1, false)], &[header(1, 500)]).unwrap();
+        assert_eq!(store.message_uids(inbox).unwrap(), HashSet::from([1]));
     }
 
     #[test]

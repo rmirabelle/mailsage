@@ -72,7 +72,11 @@ async fn token_request(form: &[(&str, &str)]) -> Result<TokenResponse> {
         return response.json().await.context("Google sent a token answer that Mail Sage cannot read");
     }
     let status = response.status();
+    let refreshing = form.contains(&("grant_type", "refresh_token"));
     match response.json::<TokenError>().await {
+        Ok(error) if refreshing && error.error == "invalid_grant" => bail!(
+            "Google ended Mail Sage's sign-in for this account. Google does this after 7 days while the Google Cloud registration is in Testing status. To stop it, use an app password: File > Add account > Gmail with app password. The account keeps its folders."
+        ),
         Ok(error) => bail!("Google refused the request: {} {}", error.error, error.error_description.unwrap_or_default()),
         Err(_) => bail!("Google refused the request ({status})"),
     }

@@ -327,6 +327,7 @@ button { border: 0; }
   cursor: pointer;
 }
 .account-toggle span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.account-unread { flex: 0 0 auto; margin-left: auto; color: var(--secondary); font-size: 11px; font-style: normal; font-weight: 700; }
 .account-action { visibility: hidden; }
 .account-header:hover .account-action { visibility: visible; }
 .account-busy, .list-busy { flex: 0 0 auto; margin: 0 5px; color: var(--muted); }
@@ -457,6 +458,7 @@ button { border: 0; }
 .dialog-body { padding: 20px 24px 18px; }
 .dialog-body h2 { margin: 0 0 12px; padding-right: 30px; color: var(--secondary); font-size: 17px; font-weight: 750; overflow-wrap: anywhere; }
 .dialog-note { margin: 0; color: #a3a8b6; font-size: 12px; line-height: 1.5; }
+.dialog-note a { color: var(--accent); text-decoration: underline; cursor: pointer; }
 .dialog-status { display: flex; align-items: flex-start; gap: 8px; margin: 0 0 10px; color: #d9dce3; font-size: 12.5px; line-height: 1.45; }
 .dialog-status svg { flex: 0 0 auto; margin-top: 1px; }
 .dialog-status.error { color: #fecaca; }

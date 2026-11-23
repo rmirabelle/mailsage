@@ -15,7 +15,7 @@ import {
   WarningOctagon,
   X
 } from "@phosphor-icons/react";
-import { useState, type ReactNode } from "react";
+import { useEffect, useState, type ReactNode } from "react";
 import type { AccountLabels } from "../lib/accountLabels";
 import { folderKey, folderRows, loadClosedFolders, saveClosedFolders } from "../lib/folders";
 import type { Account, Folder, FolderRole } from "../lib/mail";
@@ -58,7 +58,22 @@ const ROLE_ICONS: Record<FolderRole, ReactNode> = {
 
 /** The left pane: one group for each account, with its folders and unread counts. */
 export function AccountsPane({ accounts, selectedFolderId, busyAccountIds, accountErrors, accountLabels, onAccountMenu, hiddenFolders, showHidden, onSelectFolder, onFolderMenu, onAddAccount, onNewMessage, onRefreshAccount, onRemoveAccount }: Props) {
-  const [collapsed, setCollapsed] = useState<ReadonlySet<number>>(new Set());
+  /**
+   * The accounts that show their folders. At start only the first account
+   * is open; `null` means that the user has not opened or closed one yet.
+   */
+  const [expanded, setExpanded] = useState<ReadonlySet<number> | null>(null);
+  const isOpen = (accountId: number) => expanded ? expanded.has(accountId) : accountId === accounts[0]?.id;
+
+  /* The account of the selected folder opens, for example after a new account opens its inbox. */
+  useEffect(() => {
+    const account = accounts.find((candidate) => candidate.folders.some((folder) => folder.id === selectedFolderId));
+    if (!account) return;
+    setExpanded((current) => {
+      const base = current ?? new Set(accounts[0] ? [accounts[0].id] : []);
+      return base.has(account.id) ? base : new Set([...base, account.id]);
+    });
+  }, [accounts, selectedFolderId]);
 
   /** The folders that the user closed: the folders under them do not show. This is saved. */
   const [closedFolders, setClosedFolders] = useState<ReadonlySet<string>>(loadClosedFolders);
@@ -73,8 +88,8 @@ export function AccountsPane({ accounts, selectedFolderId, busyAccountIds, accou
   };
 
   const toggle = (accountId: number) => {
-    setCollapsed((current) => {
-      const next = new Set(current);
+    setExpanded((current) => {
+      const next = new Set(current ?? (accounts[0] ? [accounts[0].id] : []));
       if (!next.delete(accountId)) next.add(accountId);
       return next;
     });
@@ -104,7 +119,9 @@ export function AccountsPane({ accounts, selectedFolderId, busyAccountIds, accou
       ) : (
         <div className="account-list">
           {accounts.map((account) => {
-            const open = !collapsed.has(account.id);
+            const open = isOpen(account.id);
+            /* A closed account shows the unread count of its inbox. The other folders do not count: in Gmail, All Mail has each message again. */
+            const unread = account.folders.find((folder) => folder.role === "inbox")?.unread ?? 0;
             const busy = busyAccountIds.has(account.id);
             const error = accountErrors.get(account.id);
             return (
@@ -119,6 +136,7 @@ export function AccountsPane({ accounts, selectedFolderId, busyAccountIds, accou
                   <button className="account-toggle" onClick={() => toggle(account.id)} aria-expanded={open} title={account.email}>
                     {open ? <CaretDown size={12} /> : <CaretRight size={12} />}
                     <span>{accountLabels[account.id] ?? account.email}</span>
+                    {!open && unread > 0 && <em className="account-unread" title={`${unread} unread in the inbox`}>{unread}</em>}
                   </button>
                   {busy
                     ? <CircleNotch className="spin account-busy" size={14} />

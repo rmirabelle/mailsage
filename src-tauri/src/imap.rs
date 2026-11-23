@@ -3,6 +3,7 @@
  * Every connection is encrypted (TLS from the first byte) and the server's
  * certificate must be valid. Nothing here changes mail on the server.
  */
+use std::collections::HashSet;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -16,7 +17,7 @@ use tokio_rustls::rustls::pki_types::ServerName;
 use tokio_rustls::rustls::{ClientConfig, RootCertStore};
 use tokio_rustls::TlsConnector;
 
-use crate::store::{FolderInfo, MessageHeader};
+use crate::store::{FolderInfo, Marks, MessageHeader};
 
 pub type Session = async_imap::Session<TlsStream<TcpStream>>;
 
@@ -88,6 +89,27 @@ pub async fn open_with_token(host: &str, port: u16, email: &str, access_token: &
             None => anyhow!("{host} refused the sign-in: {error}"),
         }
     })
+}
+
+/** The server refused the address or the password. Other errors (no network, no answer) are not this one. */
+#[derive(Debug)]
+pub struct PasswordRefused(String);
+
+impl std::fmt::Display for PasswordRefused {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for PasswordRefused {}
+
+/** Opens a session with a password (a Gmail app password). The connection is encrypted before the password goes out. */
+pub async fn open_with_password(host: &str, port: u16, email: &str, password: &str) -> Result<Session> {
+    let client = connect(host, port).await?;
+    client
+        .login(email, password)
+        .await
+        .map_err(|(error, _)| PasswordRefused(format!("{host} refused the sign-in: {error}")).into())
 }
 
 /** The well-known use of a folder, from the server's marks and, for the inbox, its name. */
@@ -174,6 +196,9 @@ pub struct FolderFetch {
     pub uid_validity: Option<u32>,
     /** The lowest message number in the fetched range. */
     pub lowest_uid: u32,
+    /** Each message in the range, with its read and flag marks. */
+    pub present: Vec<Marks>,
+    /** The full list entries of the messages in the range that the caller did not know. */
     pub headers: Vec<MessageHeader>,
 }
 
@@ -189,36 +214,11 @@ fn parse_header(raw: &[u8]) -> (String, String, String) {
     (subject, name, address)
 }
 
-/** Fetches the headers of the newest `count` messages of a folder. The folder opens read-only. */
-pub async fn fetch_newest(session: &mut Session, path: &str, count: u32) -> Result<FolderFetch> {
-    let mailbox = session.examine(path).await.context("the server did not open the folder")?;
-    let mut result = FolderFetch { uid_validity: mailbox.uid_validity, lowest_uid: 1, headers: Vec::new() };
-    if mailbox.exists == 0 || count == 0 {
-        return Ok(result);
-    }
-    let first = mailbox.exists.saturating_sub(count - 1).max(1);
-    {
-        let mut fetches = session
-            .fetch(format!("{first}:{}", mailbox.exists), HEADER_ITEMS)
-            .await
-            .context("the server did not send the messages")?;
-        while let Some(fetch) = fetches.next().await {
-            let fetch = fetch.context("the server sent a message that Mail Sage cannot read")?;
-            result.headers.extend(header_of(&fetch));
-        }
-    }
-    if result.headers.is_empty() {
-        bail!("the server sent no messages for a folder that has {}", mailbox.exists);
-    }
-    /* When the fetch started at the first message, it has the full folder: each stored message that is not in it is gone. */
-    result.lowest_uid = if first == 1 { 1 } else { result.headers.iter().map(|header| header.uid).min().unwrap_or(1) };
-    Ok(result)
-}
+/** What one marks fetch asks for: much less than HEADER_ITEMS. */
+const MARK_ITEMS: &str = "(UID FLAGS)";
 
-/** Makes a list entry from one fetch answer of the server. An answer with no message number gives nothing. */
-fn header_of(fetch: &async_imap::types::Fetch) -> Option<MessageHeader> {
-    let uid = fetch.uid?;
-    let (subject, from_name, from_address) = fetch.header().map(parse_header).unwrap_or_default();
+/** The read and flag marks of one fetch answer. */
+fn marks_of(fetch: &async_imap::types::Fetch) -> (bool, bool) {
     let mut seen = false;
     let mut flagged = false;
     for flag in fetch.flags() {
@@ -228,6 +228,54 @@ fn header_of(fetch: &async_imap::types::Fetch) -> Option<MessageHeader> {
             _ => {}
         }
     }
+    (seen, flagged)
+}
+
+/**
+ * Reads the newest `count` messages of a folder. The folder opens read-only.
+ * First it gets only the number and the marks of each message, which is
+ * fast. Then it gets the full headers only of the messages that are not in
+ * `known`. `known` is for the folder numbering `known_validity`; when the
+ * server has a different numbering, all messages are new.
+ */
+pub async fn fetch_newest(session: &mut Session, path: &str, count: u32, known_validity: Option<u32>, known: &HashSet<u32>) -> Result<FolderFetch> {
+    let mailbox = session.examine(path).await.context("the server did not open the folder")?;
+    let mut result = FolderFetch { uid_validity: mailbox.uid_validity, lowest_uid: 1, present: Vec::new(), headers: Vec::new() };
+    if mailbox.exists == 0 || count == 0 {
+        return Ok(result);
+    }
+    let first = mailbox.exists.saturating_sub(count - 1).max(1);
+    {
+        let mut fetches = session
+            .fetch(format!("{first}:{}", mailbox.exists), MARK_ITEMS)
+            .await
+            .context("the server did not send the messages")?;
+        while let Some(fetch) = fetches.next().await {
+            let fetch = fetch.context("the server sent a message that Mail Sage cannot read")?;
+            if let Some(uid) = fetch.uid {
+                let (seen, flagged) = marks_of(&fetch);
+                result.present.push(Marks { uid, seen, flagged });
+            }
+        }
+    }
+    if result.present.is_empty() {
+        bail!("the server sent no messages for a folder that has {}", mailbox.exists);
+    }
+    let same_numbering = known_validity.is_some() && known_validity == mailbox.uid_validity;
+    let new: Vec<u32> = result.present.iter().map(|marks| marks.uid).filter(|uid| !same_numbering || !known.contains(uid)).collect();
+    for batch in new.chunks(CHANGE_BATCH) {
+        result.headers.extend(fetch_headers(session, batch).await?);
+    }
+    /* When the fetch started at the first message, it has the full folder: each stored message that is not in it is gone. */
+    result.lowest_uid = if first == 1 { 1 } else { result.present.iter().map(|marks| marks.uid).min().unwrap_or(1) };
+    Ok(result)
+}
+
+/** Makes a list entry from one fetch answer of the server. An answer with no message number gives nothing. */
+fn header_of(fetch: &async_imap::types::Fetch) -> Option<MessageHeader> {
+    let uid = fetch.uid?;
+    let (subject, from_name, from_address) = fetch.header().map(parse_header).unwrap_or_default();
+    let (seen, flagged) = marks_of(fetch);
     Some(MessageHeader {
         uid,
         subject,
@@ -255,10 +303,11 @@ async fn fetch_headers(session: &mut Session, uids: &[u32]) -> Result<Vec<Messag
     if uids.is_empty() {
         return Ok(headers);
     }
+    let wanted: HashSet<u32> = uids.iter().copied().collect();
     let mut fetches = session.uid_fetch(uid_set(uids), HEADER_ITEMS).await.context("the server did not send the messages")?;
     while let Some(fetch) = fetches.next().await {
         let fetch = fetch.context("the server sent a message that Mail Sage cannot read")?;
-        headers.extend(header_of(&fetch).filter(|header| uids.contains(&header.uid)));
+        headers.extend(header_of(&fetch).filter(|header| wanted.contains(&header.uid)));
     }
     Ok(headers)
 }

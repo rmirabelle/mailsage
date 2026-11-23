@@ -68,6 +68,8 @@ macro_rules! with_session {
 }
 /** The kinds of account, as the store has them. */
 const KIND_GMAIL: &str = "gmail";
+/** Gmail with an app password in place of the Google sign-in. Google does not end this sign-in after 7 days. */
+const KIND_GMAIL_PASSWORD: &str = "gmail-password";
 const KIND_MICROSOFT: &str = "microsoft";
 const KIND_MICROSOFT_WORK: &str = "microsoft365";
 
@@ -266,9 +268,48 @@ impl AppState {
                 let token = self.access_token(account).await?;
                 imap::open_with_token(&account.imap_host, account.imap_port, &account.email, &token).await
             }
+            KIND_GMAIL_PASSWORD => {
+                let password = stored_password(account)?;
+                imap::open_with_password(&account.imap_host, account.imap_port, &account.email, &password)
+                    .await
+                    .map_err(|error| if error.is::<imap::PasswordRefused>() { error.context(APP_PASSWORD_REFUSED) } else { error })
+            }
             other => bail!("Mail Sage cannot connect to a \"{other}\" account yet"),
         }
     }
+}
+
+/** What to do when Google refuses a stored app password. */
+const APP_PASSWORD_REFUSED: &str =
+    "Google refused the app password. Google cancels app passwords when you change your Google password. Make a new app password and add the account again with it";
+
+/** The app password of a Gmail app-password account, from Windows Credential Manager. */
+fn stored_password(account: &Account) -> Result<String> {
+    secrets::read(&secrets::account_target(account.id))?
+        .with_context(|| format!("Mail Sage has no app password for {}. Add the account again.", account.email))
+}
+
+/**
+ * Google shows an app password as four groups of four letters. The spaces
+ * are only for reading, so they go.
+ */
+fn clean_app_password(typed: &str) -> Result<String> {
+    let password: String = typed.chars().filter(|character| !character.is_whitespace()).collect();
+    if password.len() != 16 || !password.chars().all(|character| character.is_ascii_alphabetic()) {
+        bail!("A Google app password has 16 letters. Copy it from the Google page again.");
+    }
+    Ok(password)
+}
+
+fn clean_email(typed: &str) -> Result<String> {
+    let email = typed.trim();
+    let valid = email.len() <= 254
+        && email.split_once('@').is_some_and(|(name, domain)| !name.is_empty() && domain.contains('.'))
+        && !email.chars().any(|character| character.is_whitespace() || character.is_control());
+    if !valid {
+        bail!("Type the full Gmail address, for example name@gmail.com.");
+    }
+    Ok(email.to_string())
 }
 
 /** Clears the "sign-in running" mark when the sign-in ends, however it ends. */
@@ -365,6 +406,64 @@ pub async fn add_gmail_account(app: AppHandle, state: State<'_, AppState>) -> Re
 }
 
 /**
+ * Adds a Gmail account that signs in with an app password. The password is
+ * tested on the server first, then it goes to Windows Credential Manager.
+ * If the address is already in Mail Sage as a Gmail account with the Google
+ * sign-in, that account changes to the app password and keeps its folders;
+ * the old Google permission is cancelled.
+ */
+async fn add_gmail_password(state: &AppState, email: &str, app_password: &str) -> Result<Account> {
+    let email = clean_email(email)?;
+    let password = clean_app_password(app_password)?;
+    let session = imap::open_with_password(google::IMAP_HOST, google::IMAP_PORT, &email, &password).await.map_err(|error| {
+        if error.is::<imap::PasswordRefused>() {
+            error.context("Google refused the address or the app password. Check both, and check that 2-Step Verification is on for the account")
+        } else {
+            error
+        }
+    })?;
+    let account = match state.store.account_by_email(&email)? {
+        Some(existing) if existing.kind == KIND_GMAIL => {
+            let target = secrets::account_target(existing.id);
+            let old_token = secrets::read(&target).ok().flatten();
+            state.store.set_account_kind(existing.id, KIND_GMAIL_PASSWORD)?;
+            if let Err(error) = secrets::save(&target, &password) {
+                let _ = state.store.set_account_kind(existing.id, KIND_GMAIL);
+                return Err(error);
+            }
+            if let Some(old_token) = old_token {
+                let _ = google::revoke(&old_token).await;
+            }
+            state.tokens().remove(&existing.id);
+            state.idle_sessions().remove(&existing.id);
+            state.store.account(existing.id)?
+        }
+        Some(existing) if existing.kind == KIND_GMAIL_PASSWORD => {
+            /* A new app password for the same account. */
+            secrets::save(&secrets::account_target(existing.id), &password)?;
+            state.idle_sessions().remove(&existing.id);
+            existing
+        }
+        _ => {
+            let account = state.store.add_account(KIND_GMAIL_PASSWORD, &email, google::IMAP_HOST, google::IMAP_PORT)?;
+            if let Err(error) = secrets::save(&secrets::account_target(account.id), &password) {
+                let _ = state.store.delete_account(account.id);
+                return Err(error);
+            }
+            account
+        }
+    };
+    state.keep_session(account.id, session, true);
+    Ok(account)
+}
+
+/** Adds a Gmail account with an app password, or changes a Gmail account with the same address to the app password. */
+#[tauri::command]
+pub async fn add_gmail_app_password(state: State<'_, AppState>, email: String, app_password: String) -> Result<Account, String> {
+    add_gmail_password(&state, &email, &app_password).await.map_err(text)
+}
+
+/**
  * Microsoft has no command that cancels a permission. When the account is
  * not added, Mail Sage drops the tokens; they are in memory only at that time.
  */
@@ -457,10 +556,18 @@ async fn sync_folder_messages(state: &AppState, folder_id: i64) -> Result<Vec<Me
         return Ok(Vec::new());
     }
     let account = state.store.account(folder.account_id)?;
-    let fetched: Result<imap::FolderFetch> = with_session!(state, &account, |session| imap::fetch_newest(session, &folder.path, MESSAGE_LIST_SIZE));
+    /* Only the messages that the store does not have yet come with full headers. */
+    let known_validity = state.store.folder_uid_validity(folder_id)?;
+    let known = state.store.message_uids(folder_id)?;
+    let fetched: Result<imap::FolderFetch> =
+        with_session!(state, &account, |session| imap::fetch_newest(session, &folder.path, MESSAGE_LIST_SIZE, known_validity, &known));
     let fetched = fetched?;
-    state.store.save_messages(folder_id, fetched.uid_validity, fetched.lowest_uid, &fetched.headers)?;
-    apply_blocks(state, &folder, &account, fetched.headers).await;
+    state.store.merge_messages(folder_id, fetched.uid_validity, fetched.lowest_uid, &fetched.present, &fetched.headers)?;
+    /* The check covers the full list, so that a move that failed last time is tried again. */
+    let listed = state.store.messages(folder_id, MESSAGE_LIST_SIZE)?;
+    if apply_blocks(state, &folder, &account, listed.clone()).await.len() == listed.len() {
+        return Ok(listed);
+    }
     state.store.messages(folder_id, MESSAGE_LIST_SIZE)
 }
 
@@ -928,6 +1035,10 @@ async fn send(state: &AppState, outgoing: Outgoing) -> Result<()> {
             let token = state.access_token(&account).await?;
             compose::send_with_token(google::SMTP_HOST, compose::Encryption::FromStart, &account.email, &token, message).await?;
         }
+        (KIND_GMAIL_PASSWORD, _) => {
+            let password = stored_password(&account)?;
+            compose::send_with_password(google::SMTP_HOST, compose::Encryption::FromStart, &account.email, &password, message).await?;
+        }
         (_, Some(audience)) => {
             let token = state.access_token(&account).await?;
             compose::send_with_token(audience.smtp_host(), compose::Encryption::StartTls, &account.email, &token, message).await?;
@@ -942,4 +1053,33 @@ async fn send(state: &AppState, outgoing: Outgoing) -> Result<()> {
 #[tauri::command]
 pub async fn send_message(state: State<'_, AppState>, outgoing: Outgoing) -> Result<(), String> {
     send(&state, outgoing).await.map_err(text)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn takes_an_app_password_with_or_without_spaces() {
+        assert_eq!(clean_app_password("abcd efgh ijkl mnop").unwrap(), "abcdefghijklmnop");
+        assert_eq!(clean_app_password(" abcdefghijklmnop ").unwrap(), "abcdefghijklmnop");
+    }
+
+    #[test]
+    fn refuses_what_is_not_an_app_password() {
+        assert!(clean_app_password("").is_err());
+        assert!(clean_app_password("abcd efgh ijkl").is_err());
+        assert!(clean_app_password("abcd efgh ijkl mno1").is_err());
+        assert!(clean_app_password("my password!").is_err());
+    }
+
+    #[test]
+    fn checks_the_email_address() {
+        assert_eq!(clean_email("  me@gmail.com ").unwrap(), "me@gmail.com");
+        assert!(clean_email("me").is_err());
+        assert!(clean_email("@gmail.com").is_err());
+        assert!(clean_email("me@gmail").is_err());
+        assert!(clean_email("me @gmail.com").is_err());
+        assert!(clean_email("me@gmail.com\r\nA1 LOGOUT").is_err());
+    }
 }

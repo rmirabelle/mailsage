@@ -28,6 +28,10 @@ order of work.
   `secrets.rs` is Windows Credential Manager. `google.rs` is the Google
   sign-in (Gmail) and `microsoft.rs` is the Microsoft sign-in (Outlook.com,
   Hotmail); `oauth.rs` has the browser part that the two have in common.
+  A Gmail account can also sign in with an app password (kind
+  `gmail-password`, `add_gmail_app_password` in `accounts.rs`): the password
+  is in Windows Credential Manager, and IMAP and SMTP use it only on an
+  encrypted connection.
   `imap.rs` reads folders and headers from the server.
 - `src-tauri/src/preview.rs` is the secure preview: it cleans message HTML and
   builds the page for the preview frame. Its tests are the set of hostile

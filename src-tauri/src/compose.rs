@@ -141,14 +141,23 @@ pub enum Encryption {
 
 /** Sends a message through an SMTP server with an OAuth access token. */
 pub async fn send_with_token(host: &str, encryption: Encryption, email: &str, access_token: &str, message: Message) -> Result<()> {
+    send_with(host, encryption, email, access_token, Mechanism::Xoauth2, message).await
+}
+
+/** Sends a message through an SMTP server with a password (a Gmail app password). The connection is encrypted before the password goes out. */
+pub async fn send_with_password(host: &str, encryption: Encryption, email: &str, password: &str, message: Message) -> Result<()> {
+    send_with(host, encryption, email, password, Mechanism::Plain, message).await
+}
+
+async fn send_with(host: &str, encryption: Encryption, email: &str, secret: &str, mechanism: Mechanism, message: Message) -> Result<()> {
     let transport = match encryption {
         Encryption::FromStart => AsyncSmtpTransport::<Tokio1Executor>::relay(host),
         Encryption::StartTls => AsyncSmtpTransport::<Tokio1Executor>::starttls_relay(host),
     };
     let mailer = transport
         .map_err(|error| anyhow!("could not prepare the connection to {host}: {error}"))?
-        .credentials(Credentials::new(email.to_string(), access_token.to_string()))
-        .authentication(vec![Mechanism::Xoauth2])
+        .credentials(Credentials::new(email.to_string(), secret.to_string()))
+        .authentication(vec![mechanism])
         .timeout(Some(SEND_TIME_LIMIT))
         .build();
     mailer.send(message).await.map_err(|error| anyhow!("{host} did not accept the message: {error}"))?;

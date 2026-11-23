@@ -40,10 +40,23 @@ A new registration has the publishing status **Testing**. In this status:
 
 - Only the Google accounts in the **Test users** list can sign in. Add your
   Gmail address there (**Audience → Test users**).
-- Google cancels the sign-in after 7 days. Mail Sage then tells you to remove
-  the account and add it again.
+- Google cancels the sign-in after 7 days. Mail Sage then tells you to sign
+  in again.
 
-To remove the 7-day limit, select **Publish app** on the **Audience** page.
+The simplest way around the 7-day limit is a Google app password, which does
+not expire:
+
+1. Turn on 2-Step Verification for your Google account.
+2. Open <https://myaccount.google.com/apppasswords>, type a name (for example
+   Mail Sage), and copy the 16 letters.
+3. In Mail Sage, select **File → Add account → Gmail with app password**.
+   Type your address and the app password. If the address is already in Mail
+   Sage, the account changes to the app password and keeps its folders.
+
+Google cancels all app passwords when you change your Google password. Then
+make a new one and add it the same way.
+
+You can also select **Publish app** on the **Audience** page.
 The status becomes **In production**. Google does not review the app until you
 ask for it. Without the review, the sign-in page shows a warning that Google
 has not verified the app. Because the app is yours, select **Advanced**, then
